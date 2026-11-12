@@ -14,6 +14,10 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from maya250m import CONFIGS, TORCH_AVAILABLE, get_config
+from maya250m.memory.projection import memory_projection_parameters
+
+#: Hard ceiling for the flagship preset. Auxiliary heads must fit inside it.
+PARAMETER_BUDGET = 251_000_000
 
 
 def compute_analytical_params(cfg: dict) -> Tuple[int, int]:
@@ -114,11 +118,25 @@ def compute_preset_ledger(name: str) -> dict:
     eff_2x = int(cfg["prelude_layers"]) + 2 * int(cfg["core_layers"]) + int(cfg["coda_layers"])
     eff_4x = int(cfg["prelude_layers"]) + 4 * int(cfg["core_layers"]) + int(cfg["coda_layers"])
 
+    # Auxiliary (non-checkpointed) heads: the shared-trunk memory projection W_mem.
+    # It lives outside MayaModel.state_dict() to keep Schema-9 checkpoints compatible,
+    # so it must be accounted for explicitly here.
+    w_mem_params = memory_projection_parameters(int(cfg["d"]))
+    trainable_total = total_params + w_mem_params
+    if name == "MAYA_250M":
+        assert trainable_total <= PARAMETER_BUDGET, (
+            f"MAYA_250M exceeds the {PARAMETER_BUDGET:,} parameter budget: {trainable_total:,}"
+        )
+
     return {
         "preset": name,
         "total_parameters": total_params,
         "active_inference_parameters": active_inference_params,
         "mtp_head_parameters": mtp_params,
+        "auxiliary_memory_head_parameters": w_mem_params,
+        "trainable_total_with_auxiliary": trainable_total,
+        "parameter_budget": PARAMETER_BUDGET,
+        "within_budget": trainable_total <= PARAMETER_BUDGET,
         "physical_layers": int(cfg["layers"]),
         "effective_layers_2x_loop": eff_2x,
         "effective_layers_4x_loop": eff_4x,

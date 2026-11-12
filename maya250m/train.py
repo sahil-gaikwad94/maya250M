@@ -387,12 +387,13 @@ def evaluate_maya(
                 total_lm_targets += n_lm
                 inter_sum += float(comp["intermediate_loss"].item()) * n_lm
 
+            # BUG-07 fix: accumulate each horizon's own CE, never the pooled mtp_loss.
             h_counts = comp.get("mtp_horizon_counts", [])
-            if sum(h_counts) > 0:
-                for idx, cnt in enumerate(h_counts[:3]):
-                    if cnt > 0:
-                        horizon_sums[idx] += float(comp["mtp_loss"].item()) * cnt
-                        horizon_counts[idx] += cnt
+            h_losses = comp.get("mtp_horizon_losses", [])
+            for idx, cnt in enumerate(h_counts[:3]):
+                if cnt > 0 and idx < len(h_losses) and h_losses[idx] is not None:
+                    horizon_sums[idx] += float(h_losses[idx].item()) * cnt
+                    horizon_counts[idx] += cnt
 
     if was_training:
         model.train()
@@ -577,13 +578,25 @@ def train_maya(
                         step_inter_loss_val += float(comp["intermediate_loss"].item()) * lm_scale
 
                 mb_mtp_counts = comp.get("mtp_horizon_counts", [])
+                mb_mtp_losses = comp.get("mtp_horizon_losses", [])
                 if active_horizons > 0 and mtp_weight > 0.0 and sum(mb_mtp_counts) > 0:
-                    # Group-normalized MTP contribution
-                    tot_mb_mtp = sum(mb_mtp_counts)
-                    tot_grp_mtp = max(1, sum(group_mtp_counts[:active_mtp_d]))
-                    mtp_scale = float(tot_mb_mtp) / float(tot_grp_mtp)
-                    mb_obj = mb_obj + float(mtp_weight) * comp["mtp_loss"] * mtp_scale
-                    step_mtp_loss_val += float(comp["mtp_loss"].item()) * mtp_scale
+                    # BUG-07 fix: normalize each horizon k by its own group-wide valid-token
+                    # count, then average equally across the active horizons. This makes
+                    # microbatch gradient accumulation exactly equal (to < 1e-6) to a single
+                    # concatenated batch even when horizons have unequal valid counts.
+                    per_hzn = float(mtp_weight) / float(active_horizons)
+                    for k_idx in range(
+                        min(active_mtp_d, len(mb_mtp_losses), len(group_mtp_counts))
+                    ):
+                        cnt_k = int(mb_mtp_counts[k_idx]) if k_idx < len(mb_mtp_counts) else 0
+                        if cnt_k <= 0 or group_mtp_counts[k_idx] <= 0:
+                            continue
+                        loss_k = mb_mtp_losses[k_idx]
+                        if loss_k is None:
+                            continue
+                        frac_k = float(cnt_k) / float(group_mtp_counts[k_idx])
+                        mb_obj = mb_obj + per_hzn * loss_k * frac_k
+                        step_mtp_loss_val += float(loss_k.item()) * frac_k * per_hzn
 
                 mb_obj.backward()
 

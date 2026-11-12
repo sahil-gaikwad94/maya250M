@@ -493,10 +493,12 @@ class GatedDeltaNetLayer(nn.Module):
                 same_intra = ((docs_c[:, :, None] == docs_c[:, None, :]) & valid_tok[:, :, None]) | diag_bool
                 gamma_mat = gamma_mat * same_intra[:, None, :, :].to(torch.float32)
 
-                if cur_prev_doc is not None:
-                    same_as_init = (docs_c == cur_prev_doc[:, None]) & valid_tok
-                else:
-                    same_as_init = torch.zeros_like(valid_tok)
+                # BUG-05 fix: on the very first chunk there is no explicit ``prev_doc``
+                # carried over from a cache, yet a non-zero initial state ``S`` may still
+                # belong to the document opening this chunk. Match against the first
+                # token's own doc id instead of zeroing the whole carry-in contribution.
+                eff_prev = cur_prev_doc if cur_prev_doc is not None else docs_c[:, 0]
+                same_as_init = (docs_c == eff_prev[:, None]) & valid_tok
                 gamma_from_init = gamma_from_init * same_as_init[:, None, :].to(torch.float32)
             else:
                 docs_c = None
@@ -832,11 +834,14 @@ class MayaModel(nn.Module):
         x_anchor = x
         for loop_idx in range(loops):
             if loop_idx > 0:
-                normed_loop = rms_norm_fp32(
-                    x, self.core_loop_norm, self.norm_eps, self.zc
-                )
+                # BUG-06 fix: invert the residual so the loop state ``x`` is the
+                # unit-Jacobian backbone and the prelude anchor is gated by ``core_loop_gate``.
+                # At initialization (core_loop_gate=0, core_loop_norm=0, zero-centered
+                # RMSNorm), ``x`` now flows into Loop 1 intact (non-zero signal and
+                # non-zero gradients from step 1), while gate controls the injected
+                # anchor contribution rather than the entire loop output.
                 gate = torch.tanh(self.core_loop_gate)
-                x = x_anchor + gate * normed_loop
+                x = rms_norm_fp32(x + gate * x_anchor, self.core_loop_norm, self.norm_eps, self.zc)
             for idx in range(p_end, c_end):
                 x, _ = self.blocks[idx](
                     x, cache=None, seq_start=0, doc_ids=doc_ids, force_recurrent=force_recurrent
@@ -888,13 +893,15 @@ class MayaModel(nn.Module):
                 if mtp_active_depth is None
                 else min(self.mtp_depth, int(mtp_active_depth))
             )
-            mtp_horizon_losses: List[torch.Tensor] = []
+            # BUG-07 fix: expose per-horizon MTP cross-entropy losses and counts.
+            mtp_horizon_losses: List[Optional[torch.Tensor]] = []
             mtp_horizon_counts: List[int] = []
             if eff_mtp_depth > 0 and self.mtp_head is not None and n >= 3:
                 h_draft = h[:, :-1, :]
                 for k_hor in range(1, eff_mtp_depth + 1):
                     if n <= k_hor + 1:
                         mtp_horizon_counts.append(0)
+                        mtp_horizon_losses.append(None)
                         continue
                     cond_ids = input_ids[:, k_hor : n - 1].clamp(min=0)
                     h_draft = self.mtp_head(h_draft[:, :-1, :], self.embed(cond_ids))
@@ -912,21 +919,25 @@ class MayaModel(nn.Module):
 
                     valid_k = int((mtp_targets_k != -100).sum().item())
                     mtp_horizon_counts.append(valid_k)
-                    if valid_k > 0:
-                        loss_k = F.cross_entropy(
+                    mtp_horizon_losses.append(
+                        F.cross_entropy(
                             mtp_logits_k.reshape(-1, self.vocab),
                             mtp_targets_k.reshape(-1),
                             ignore_index=-100,
                         )
-                        mtp_horizon_losses.append(loss_k)
+                        if valid_k > 0
+                        else torch.tensor(0.0, device=mtp_logits_k.device)
+                    )
 
-            if mtp_horizon_losses:
-                mtp_loss = torch.stack(mtp_horizon_losses).mean()
-                if mtp_weight > 0.0:
+            # pooled MTP loss for backwards compatibility
+            mtp_loss = logits.sum() * 0.0
+            if mtp_weight > 0.0:
+                active_losses = [x for x in mtp_horizon_losses if x is not None]
+                if active_losses:
+                    mtp_loss = torch.stack(active_losses).mean()
                     total_loss = total_loss + float(mtp_weight) * mtp_loss
-            else:
-                mtp_loss = logits.sum() * 0.0
             components["mtp_loss"] = mtp_loss
+            components["mtp_horizon_losses"] = mtp_horizon_losses  # per-horizon CE (k+1) or 0.0
             components["mtp_horizon_counts"] = mtp_horizon_counts
             components["mtp_valid_targets"] = sum(mtp_horizon_counts)
 
@@ -960,8 +971,14 @@ class MayaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         doc_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]], dict]:
-        """Prefill hybrid cache (always 1 pass through physical blocks for exact KV/GDN state)."""
+        num_loops: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, dict, dict]:
+        """Loop-consistent prefill matching ``MayaModel.forward()`` for any ``num_loops >= 1``.
+
+        BUG-01 fix: the Recurrent Core is iterated ``num_loops`` times exactly as in
+        ``forward()``, with one isolated hybrid cache per pass, so training and
+        inference execute the same mathematical function.
+        """
         orig_len = int(input_ids.shape[1])
         truncated = False
         dropped = 0
@@ -972,50 +989,183 @@ class MayaModel(nn.Module):
                 doc_ids = doc_ids[:, -self.max_ctx :]
             truncated = True
 
+        loops = max(1, int(self.recurrent_loops if num_loops is None else num_loops))
+        p_end = self.prelude_layers
+        c_end = p_end + self.core_layers
+
         x = self.embed(input_ids)
-        caches: List[Dict[str, torch.Tensor]] = []
-        for block in self.blocks:
-            x, c = block(x, cache=None, seq_start=0, doc_ids=doc_ids)
-            caches.append(c)
+        prelude_caches: List[Dict[str, torch.Tensor]] = []
+        for idx in range(0, p_end):
+            x, c = self.blocks[idx](x, cache=None, seq_start=0, doc_ids=doc_ids)
+            prelude_caches.append(c)
+
+        x_anchor = x
+        core_loops_caches: List[List[Dict[str, torch.Tensor]]] = []
+        for loop_idx in range(loops):
+            if loop_idx > 0:
+                gate = torch.tanh(self.core_loop_gate)
+                x = rms_norm_fp32(
+                    x + gate * x_anchor, self.core_loop_norm, self.norm_eps, self.zc
+                )
+            pass_caches: List[Dict[str, torch.Tensor]] = []
+            for idx in range(p_end, c_end):
+                x, c = self.blocks[idx](x, cache=None, seq_start=0, doc_ids=doc_ids)
+                pass_caches.append(c)
+            core_loops_caches.append(pass_caches)
+
+        coda_caches: List[Dict[str, torch.Tensor]] = []
+        for idx in range(c_end, self.layers_n):
+            x, c = self.blocks[idx](x, cache=None, seq_start=0, doc_ids=doc_ids)
+            coda_caches.append(c)
+
         h = rms_norm_fp32(x, self.norm, self.norm_eps, self.zc)
         logits = self._project_logits(h)
+
+        eff_len = int(input_ids.shape[1])
+        cache_bundle = {
+            "schema_version": 2,
+            "num_loops": loops,
+            "position": eff_len,
+            "batch_size": int(input_ids.shape[0]),
+            "config_hash": self.config_hash(),
+            "prelude": prelude_caches,
+            "core_loops": core_loops_caches,
+            "coda": coda_caches,
+        }
         info = {
             "truncated": truncated,
             "tokens_dropped": dropped,
-            "effective_len": int(input_ids.shape[1]),
+            "effective_len": eff_len,
+            "num_loops": loops,
             "last_hidden": h[:, -1:, :],
         }
-        return logits[:, -1, :], caches, info
+        return logits[:, -1, :], cache_bundle, info
 
     def decode_step(
         self,
         token_id: torch.Tensor,
-        caches: List[Dict[str, torch.Tensor]],
-        seq_start: int,
+        cache_bundle: dict,
+        seq_start: Optional[int] = None,
         return_hidden: bool = False,
     ):
-        """Single-token incremental decode step over the hybrid cache."""
+        """Single-token incremental decode executing Prelude -> R x Core -> Coda.
+
+        BUG-01 fix: mirrors ``forward()``/``prefill()`` for any loop count, using the
+        per-loop ``schema_version = 2`` cache topology.
+        """
+        if not isinstance(cache_bundle, dict) or cache_bundle.get("schema_version") != 2:
+            raise ValueError(
+                "Invalid or obsolete hybrid cache schema; expected schema_version=2 dict"
+            )
+        if cache_bundle.get("config_hash") != self.config_hash():
+            raise ValueError("Hybrid cache config_hash mismatch with live MayaModel")
+
+        loops = int(cache_bundle["num_loops"])
+        pos = int(cache_bundle["position"] if seq_start is None else seq_start)
+        p_end = self.prelude_layers
+        c_end = p_end + self.core_layers
+
         x = self.embed(token_id)
-        new_caches: List[Dict[str, torch.Tensor]] = []
-        for block, c in zip(self.blocks, caches):
-            x, nc = block(x, cache=c, seq_start=seq_start, doc_ids=None, force_recurrent=True)
-            new_caches.append(nc)
+        new_prelude: List[Dict[str, torch.Tensor]] = []
+        for idx, blk_c in zip(range(0, p_end), cache_bundle["prelude"]):
+            x, nc = self.blocks[idx](
+                x, cache=blk_c, seq_start=pos, doc_ids=None, force_recurrent=True
+            )
+            new_prelude.append(nc)
+
+        x_anchor = x
+        new_core_loops: List[List[Dict[str, torch.Tensor]]] = []
+        for loop_idx in range(loops):
+            if loop_idx > 0:
+                gate = torch.tanh(self.core_loop_gate)
+                x = rms_norm_fp32(
+                    x + gate * x_anchor, self.core_loop_norm, self.norm_eps, self.zc
+                )
+            pass_in = cache_bundle["core_loops"][loop_idx]
+            pass_out: List[Dict[str, torch.Tensor]] = []
+            for idx, blk_c in zip(range(p_end, c_end), pass_in):
+                x, nc = self.blocks[idx](
+                    x, cache=blk_c, seq_start=pos, doc_ids=None, force_recurrent=True
+                )
+                pass_out.append(nc)
+            new_core_loops.append(pass_out)
+
+        new_coda: List[Dict[str, torch.Tensor]] = []
+        for idx, blk_c in zip(range(c_end, self.layers_n), cache_bundle["coda"]):
+            x, nc = self.blocks[idx](
+                x, cache=blk_c, seq_start=pos, doc_ids=None, force_recurrent=True
+            )
+            new_coda.append(nc)
+
         h = rms_norm_fp32(x, self.norm, self.norm_eps, self.zc)
         logits = self._project_logits(h)[:, -1, :]
+        new_bundle = {
+            "schema_version": 2,
+            "num_loops": loops,
+            "position": pos + int(token_id.shape[1]),
+            "batch_size": int(token_id.shape[0]),
+            "config_hash": self.config_hash(),
+            "prelude": new_prelude,
+            "core_loops": new_core_loops,
+            "coda": new_coda,
+        }
         if return_hidden:
-            return logits, new_caches, h
-        return logits, new_caches
+            return logits, new_bundle, h
+        return logits, new_bundle
 
 
-def clone_hybrid_cache(cache: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
-    """Deep-copy both GDN recurrent states and Full-Attention KV tensors."""
-    cloned: List[Dict[str, torch.Tensor]] = []
-    for layer_c in cache:
-        entry: Dict[str, torch.Tensor] = {}
-        for k, v in layer_c.items():
-            entry[k] = v.clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)
-        cloned.append(entry)
-    return cloned
+def create_empty_hybrid_cache_v2(
+    num_loops: int,
+    prelude_layers: int,
+    core_layers: int,
+    coda_layers: int,
+    batch_size: int,
+    config_hash: str,
+) -> dict:
+    """Create an empty ``schema_version = 2`` multi-loop hybrid cache bundle."""
+    return {
+        "schema_version": 2,
+        "num_loops": int(num_loops),
+        "position": 0,
+        "batch_size": int(batch_size),
+        "config_hash": str(config_hash),
+        "prelude": [None for _ in range(prelude_layers)],
+        "core_loops": [[None for _ in range(core_layers)] for _ in range(num_loops)],
+        "coda": [None for _ in range(coda_layers)],
+    }
+
+
+def clone_hybrid_cache(cache):
+    """Recursively deep-copy v1 flat list caches or v2 structured multi-loop caches."""
+    if isinstance(cache, torch.Tensor):
+        return cache.clone()
+    if isinstance(cache, list):
+        return [clone_hybrid_cache(item) for item in cache]
+    if isinstance(cache, dict):
+        return {k: clone_hybrid_cache(v) for k, v in cache.items()}
+    return copy.deepcopy(cache)
+
+
+def truncate_hybrid_cache_at_token(cache, tok_idx: int):
+    """Recursively truncate Full-Attention KV tensors at ``tok_idx`` (v1 or v2 caches)."""
+    tok_idx = int(tok_idx)
+    if isinstance(cache, list):
+        for item in cache:
+            truncate_hybrid_cache_at_token(item, tok_idx)
+        return cache
+    if isinstance(cache, dict):
+        if "k" in cache and "v" in cache and isinstance(cache["k"], torch.Tensor):
+            if cache["k"].shape[2] > tok_idx:
+                cache["k"] = cache["k"][:, :, :tok_idx, :]
+                cache["v"] = cache["v"][:, :, :tok_idx, :]
+        else:
+            for key in ("prelude", "core_loops", "coda"):
+                if key in cache:
+                    truncate_hybrid_cache_at_token(cache[key], tok_idx)
+            if "position" in cache:
+                cache["position"] = min(int(cache["position"]), tok_idx)
+        return cache
+    return cache
 
 
 def hash_config(config: dict) -> str:

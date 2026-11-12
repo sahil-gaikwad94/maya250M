@@ -31,7 +31,13 @@ from .tokenizer import (
     BPETokenizer,
     token_category,
 )
-from .vexx import Vexx35Controller, Vexx3Controller, clone_cache_generic, safe_sympy
+from .vexx import (
+    Vexx35Controller,
+    Vexx3Controller,
+    clone_cache_generic,
+    safe_sympy,
+    truncate_cache_at_token,
+)
 
 try:
     from .checkpoint import (
@@ -60,8 +66,17 @@ try:
         SwiGLU,
         build_maya_model,
         clone_hybrid_cache,
+        create_empty_hybrid_cache_v2,
         hash_config,
         rms_norm_fp32,
+        truncate_hybrid_cache_at_token,
+    )
+    from .adaptive import (
+        SolveConfig,
+        SolveResult,
+        generate_adaptive,
+        select_loops,
+        solve_task,
     )
     from .train import (
         ForwardMTPCurriculum,

@@ -31,23 +31,52 @@ from .tokenizer import (
     token_category,
 )
 
-__all__ = ["Vexx35Controller", "Vexx3Controller", "safe_sympy", "clone_cache_generic"]
+__all__ = [
+    "Vexx35Controller",
+    "Vexx3Controller",
+    "safe_sympy",
+    "clone_cache_generic",
+    "truncate_cache_at_token",
+]
 
 
-def clone_cache_generic(cache: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Deep-copy hybrid KV and GDN recurrent state caches (supports Torch and NumPy)."""
-    cloned: List[Dict[str, Any]] = []
-    for layer_c in cache:
-        entry: Dict[str, Any] = {}
-        for k, v in layer_c.items():
-            if hasattr(v, "clone"):
-                entry[k] = v.clone()
-            elif isinstance(v, np.ndarray):
-                entry[k] = v.copy()
-            else:
-                entry[k] = copy.deepcopy(v)
-        cloned.append(entry)
-    return cloned
+def clone_cache_generic(cache: Any) -> Any:
+    """Recursively deep-copy v1 list caches or v2 structured multi-loop caches.
+
+    Works with Torch tensors and NumPy arrays so it is usable from CPU-only
+    annotation workers as well as from live decode loops.
+    """
+    if hasattr(cache, "clone"):
+        return cache.clone()
+    if isinstance(cache, np.ndarray):
+        return cache.copy()
+    if isinstance(cache, list):
+        return [clone_cache_generic(item) for item in cache]
+    if isinstance(cache, dict):
+        return {k: clone_cache_generic(v) for k, v in cache.items()}
+    return copy.deepcopy(cache)
+
+
+def truncate_cache_at_token(cache: Any, tok_idx: int) -> Any:
+    """Recursively truncate Full-Attention KV tensors at ``tok_idx`` (v1 or v2 caches)."""
+    tok_idx = int(tok_idx)
+    if isinstance(cache, list):
+        for item in cache:
+            truncate_cache_at_token(item, tok_idx)
+        return cache
+    if isinstance(cache, dict):
+        if "k" in cache and "v" in cache and hasattr(cache["k"], "shape"):
+            if cache["k"].shape[2] > tok_idx:
+                cache["k"] = cache["k"][:, :, :tok_idx, :]
+                cache["v"] = cache["v"][:, :, :tok_idx, :]
+        else:
+            for key in ("prelude", "core_loops", "coda"):
+                if key in cache:
+                    truncate_cache_at_token(cache[key], tok_idx)
+            if "position" in cache:
+                cache["position"] = min(int(cache["position"]), tok_idx)
+        return cache
+    return cache
 
 
 _SANDBOX_DRIVER = r'''
@@ -215,27 +244,59 @@ class Vexx35Controller:
 
     @classmethod
     def extract_ast_symbol_table(cls, code_text: str) -> Dict[str, Dict[str, Any]]:
+        """Extract single-line, multi-line, ``async def`` and class-method signatures.
+
+        BUG-09 fix: the previous single-line scanner missed multi-line signatures,
+        coroutines, and indented class methods, so in-flight masking blocked valid
+        calls in real multi-file codebases.
+        """
         extracted: Dict[str, Dict[str, Any]] = {}
-        for line in code_text.splitlines():
-            candidate = line.strip()
-            if candidate.startswith("def ") and candidate.endswith(":"):
-                try:
-                    tree = ast.parse(candidate + "\n    pass")
-                except SyntaxError:
-                    continue
-                for node in tree.body:
-                    if isinstance(node, ast.FunctionDef):
-                        n_pos = len(node.args.args)
-                        n_def = len(node.args.defaults)
-                        has_vararg = node.args.vararg is not None or node.args.kwarg is not None
-                        extracted[node.name] = {
-                            "min_arity": n_pos - n_def,
-                            "max_arity": None if has_vararg else n_pos,
-                            "return_type": (
-                                ast.unparse(node.returns) if node.returns is not None else "any"
-                            ),
-                        }
+        # 1. Prefer a full-file parse when the candidate/in-flight text is complete.
+        try:
+            full_tree = ast.parse(code_text)
+        except (SyntaxError, ValueError):
+            full_tree = None
+        if full_tree is not None:
+            for node in ast.walk(full_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cls._record_func_node(node, extracted)
+            return extracted
+
+        # 2. Fallback for partially generated code: match multi-line (async )?def headers.
+        header_pat = re.compile(
+            r"(?:^[ \t]*|\n[ \t]*)(?:async[ \t]+)?def[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
+            r"\([^()]*\)[ \t]*(?:->[ \t]*[^:\n]+)?[ \t]*:",
+            re.DOTALL,
+        )
+        for match in header_pat.finditer(code_text):
+            raw_hdr = match.group(0).lstrip()
+            try:
+                tree = ast.parse(raw_hdr + "\n    pass")
+            except (SyntaxError, ValueError):
+                continue
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cls._record_func_node(node, extracted)
         return extracted
+
+    @staticmethod
+    def _record_func_node(node: ast.AST, table: Dict[str, Dict[str, Any]]) -> None:
+        """Record one function/method signature (arity bounds + return type) into ``table``."""
+        args_obj = getattr(node, "args", None)
+        if args_obj is None:
+            return
+        pos_args = [a.arg for a in args_obj.args]
+        if pos_args and pos_args[0] in ("self", "cls"):
+            pos_args = pos_args[1:]
+        n_pos = len(pos_args)
+        n_def = len(args_obj.defaults)
+        has_vararg = args_obj.vararg is not None or args_obj.kwarg is not None
+        returns = getattr(node, "returns", None)
+        table[getattr(node, "name", "")] = {
+            "min_arity": max(0, n_pos - n_def),
+            "max_arity": None if has_vararg else n_pos,
+            "return_type": ast.unparse(returns) if returns is not None else "any",
+        }
 
     @staticmethod
     def _lex_code_state(code_prefix: str) -> Dict[str, Any]:
@@ -695,11 +756,9 @@ class Vexx35Controller:
             widened_lo = math.nextafter(bound_float, -float("inf"))
             self.bounds[c_var] = (max(lo, widened_lo), hi)
 
-        rewound_cache = clone_cache_generic(culprit["cache"])
-        for layer_c in rewound_cache:
-            if "k" in layer_c and layer_c["k"].shape[2] > tok_idx:
-                layer_c["k"] = layer_c["k"][:, :, :tok_idx, :]
-                layer_c["v"] = layer_c["v"][:, :, :tok_idx, :]
+        # BUG-08 fix: recursively rewind v1 flat list caches and v2 structured
+        # multi-loop caches ({"prelude", "core_loops", "coda"}).
+        rewound_cache = truncate_cache_at_token(clone_cache_generic(culprit["cache"]), tok_idx)
 
         self.checkpoints = [cp for cp in self.checkpoints if cp["token_idx"] <= tok_idx]
         return tok_idx, rewound_cache, self.bounds[c_var]

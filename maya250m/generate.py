@@ -37,6 +37,7 @@ class GenerationResult:
     tokens_generated: int
     truncated: bool
     provenance: List[str] = field(default_factory=list)
+    num_loops: int = 0  # recurrent-core loops actually executed
 
     @property
     def text(self) -> str:
@@ -86,8 +87,14 @@ def generate_maya(
     mode: str = PLAIN,
     provenance: Optional[List[str]] = None,
     context_mode: str = "rolling_window",
+    num_loops: Optional[int] = None,
 ) -> GenerationResult:
-    """Generate a continuation with Vexx 3.5 neuro-symbolic verification."""
+    """Generate a continuation with Vexx 3.5 neuro-symbolic verification.
+
+    ``num_loops`` selects how many times the Recurrent Core is executed. The value
+    is stored in the hybrid cache and reused by every ``decode_step``, so prefill
+    and decode always execute the same function (BUG-01 invariant).
+    """
     if mode not in VALID_MODES:
         raise ValueError(f"unknown decoding mode {mode!r}; valid: {sorted(VALID_MODES)}")
     if context_mode not in {"rolling_window", "strict"}:
@@ -105,7 +112,8 @@ def generate_maya(
         truncated = True
     input_ids = torch.tensor([ids], dtype=torch.long)
 
-    logits, cache, truncation_info = model.prefill(input_ids)
+    logits, cache, truncation_info = model.prefill(input_ids, num_loops=num_loops)
+    loops_used = int(truncation_info.get("num_loops", 0))
     seq_start = int(input_ids.shape[1]) - truncation_info["tokens_dropped"]
 
     if context_mode == "strict" and (truncated or truncation_info["truncated"]):
@@ -120,6 +128,7 @@ def generate_maya(
             tokens_generated=0,
             truncated=True,
             provenance=origins if provenance is None else provenance,
+            num_loops=loops_used,
         )
 
     if truncated or truncation_info["truncated"]:
@@ -171,11 +180,21 @@ def generate_maya(
                 value = vexx.crane_cas_evaluate(m_cas.group(1).strip()) + ">>"
                 if not value.startswith("ERROR"):
                     origins.append("deterministic_calculation")
+                    # BUG-10 fix: never let a spliced CAS result overrun the generation
+                    # budget or the model context window.
+                    if len(generated) >= max_new_tokens or (
+                        context_mode == "strict" and seq_start >= model.max_ctx
+                    ):
+                        break
                     logits, cache = model.decode_step(
                         torch.tensor([[next_id]], dtype=torch.long), cache, seq_start
                     )
                     seq_start += 1
                     for cid in tokenizer.encode(value, add_bos=False, add_eos=False):
+                        if len(generated) >= max_new_tokens or (
+                            context_mode == "strict" and seq_start >= model.max_ctx
+                        ):
+                            break
                         logits, cache = model.decode_step(
                             torch.tensor([[cid]], dtype=torch.long), cache, seq_start
                         )
@@ -192,11 +211,21 @@ def generate_maya(
                 script_body = cur_text[last_open + len(EXP_START) : last_close].strip()
                 obs = f" => [OBS: {vexx.execute_experiment_block(script_body)}] "
                 origins.append("experiment_execution")
+                # BUG-10 fix: bound spliced <experiment> observations by max_new_tokens
+                # and the model context window.
+                if len(generated) >= max_new_tokens or (
+                    context_mode == "strict" and seq_start >= model.max_ctx
+                ):
+                    break
                 logits, cache = model.decode_step(
                     torch.tensor([[next_id]], dtype=torch.long), cache, seq_start
                 )
                 seq_start += 1
                 for cid in tokenizer.encode(obs, add_bos=False, add_eos=False):
+                    if len(generated) >= max_new_tokens or (
+                        context_mode == "strict" and seq_start >= model.max_ctx
+                    ):
+                        break
                     logits, cache = model.decode_step(
                         torch.tensor([[cid]], dtype=torch.long), cache, seq_start
                     )
@@ -222,4 +251,5 @@ def generate_maya(
         tokens_generated=len(generated),
         truncated=truncated,
         provenance=origins if provenance is None else provenance,
+        num_loops=loops_used,
     )

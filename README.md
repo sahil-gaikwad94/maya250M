@@ -1,6 +1,6 @@
 # Maya-250M + Vexx 3.5 (Standalone Research & Engineering Bundle)
 
-**Maya-250M** is a standalone, ground-up **250.24M parameter** neuro-symbolic language model engineered specifically for **coding, mathematical derivation, deep latent thinking, and autonomous scientific research from zero**. It is designed to train from scratch at **$0 compute cost** across **Kaggle's free weekly TPU (`v3-8` / `v5e-8`) and Dual-T4 (`T4 x2`) GPU quotas**, and to serve as the verified flagship proof-of-execution for **Google's TPU Research Cloud (TRC)** program and **50B–100B MoE** seed compute grants.
+**Maya-250M** is a standalone, ground-up **250.01M parameter** (`250,007,328` weights; `250,105,632` including the auxiliary shared-trunk memory head) neuro-symbolic language model engineered specifically for **coding, mathematical derivation, deep latent thinking, and autonomous scientific research from zero**. It is designed to train from scratch at **$0 compute cost** across **Kaggle's free weekly TPU (`v3-8` / `v5e-8`) and Dual-T4 (`T4 x2`) GPU quotas**, and to serve as the verified flagship proof-of-execution for **Google's TPU Research Cloud (TRC)** program and **50B–100B MoE** seed compute grants.
 
 ## Core Architectural & Engine Innovations
 
@@ -31,6 +31,26 @@
 | `MAYA_50M_PILOT` | **62,013,792** | 59,916,128 | 16 / 24 | **4,194,304 B** | 16,777,216 B (-75%) | 3,145,728 B |
 | `MAYA_250M` | **250,007,328** | **245,287,968** | **32 / 48** | **134,217,728 B (128 MiB)** | 536,870,912 B (-75%) | **9,437,184 B (9 MiB)** |
 
+The `MAYA_250M` ledger is verified analytically **and** against a live `MayaModel` by
+`tools/param_ledger_maya.py`. The auxiliary shared-trunk memory projection
+(`W_mem`: 768 → 128, bias-free) adds **98,304** parameters, giving a trainable total of
+**250,105,632**, inside the **251,000,000** budget. `W_mem` is deliberately kept out of
+`MayaModel.state_dict()` so Schema-9 checkpoints remain backward compatible.
+
+## Intelligence Upgrade Subsystems
+
+| Module | What it adds |
+| :--- | :--- |
+| `maya250m/verification.py` | Typed `VerificationResult` + closed failure taxonomy used by every gate |
+| `maya250m/understanding.py` | `TaskSpec` parsing, constraint extraction/coverage, optional neural parser head |
+| `maya250m/reasoning/` | Five-phase state machine, adaptive loop depth (R ∈ 1..4), decomposition DAG, self-correction/abstention |
+| `maya250m/memory/` | SQLite+FTS5 typed memory, vector index, hybrid retrieval, reversible consolidation, `W_mem` projection |
+| `maya250m/codebase/` | AST repo index, PPR repo map, topological packer + AST-aligned FIM, cross-file contract checks, verified SEARCH/REPLACE patches |
+| `maya250m/agent/` | Seven bounded tools, loop-guarded CodeAct runtime, tool-output injection firewall, trajectories + process rewards with observation-masked SFT |
+| `maya250m/training/` | Staged SFT → distillation → DPO → GRPO trainers with real optimizer updates (BUG-02), zero-variance group masking, frozen references |
+| `maya250m/evaluation/` | Five separate measurement identities, executable harness with explicit `NOT_RUN`, A–P ablation matrix |
+| `maya250m/adaptive.py` | Inference bridge: `TaskSpec` → critical-ambiguity abstention → loop count selection → verified bounded revision, emitting a correctly-identified `Measurement` |
+
 ## Quickstart Commands
 
 ```bash
@@ -42,6 +62,9 @@ python3 tools/param_ledger_maya.py
 
 # 3. Run the end-to-end smoke test (dedup -> BPE -> Muon+AdamW train -> ckpt -> Vexx 3.5 decode)
 python3 run_maya250m.py --preset MAYA_TINY_TEST --steps 10
+
+# 3b. Same, but pick the recurrent-core loop count per prompt (adaptive depth)
+python3 run_maya250m.py --preset MAYA_TINY_TEST --steps 10 --adaptive-depth --max-new-tokens 16
 
 # 4. Pack binary uint16 memmap shards on a free Kaggle CPU session
 python3 kaggle/pack_shards_cpu.py --output-prefix /tmp/maya_shard --seq-len 128

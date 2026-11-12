@@ -19,6 +19,8 @@ import torch
 from maya250m import (
     PLAIN,
     PYTHON,
+    SolveConfig,
+    generate_adaptive,
     BPETokenizer,
     StreamPackedDataset,
     Vexx35Controller,
@@ -51,6 +53,12 @@ def main() -> int:
     parser.add_argument("--loops", type=int, default=2)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_maya")
     parser.add_argument("--max-wall-hours", type=float, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument(
+        "--adaptive-depth",
+        action="store_true",
+        help="choose recurrent-core loop count per prompt (AdaptiveLoopController)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -105,15 +113,31 @@ def main() -> int:
     test_metrics = evaluate_maya(reloaded, test_loader, mtp_weight=0.2)
 
     vexx = Vexx35Controller()
-    gen = generate_maya(
-        reloaded,
-        tok,
-        prompt="def solve(x: int) -> int:\n",
-        max_new_tokens=16,
-        temperature=0.0,
-        vexx=vexx,
-        mode=PYTHON,
-    )
+    prompt = "def solve(x: int) -> int:\n"
+    depth_explain = None
+    if args.adaptive_depth:
+        gen, _loops, depth_explain = generate_adaptive(
+            reloaded,
+            tok,
+            prompt=prompt,
+            config=SolveConfig(
+                max_new_tokens=args.max_new_tokens,
+                max_loops=max(1, min(4, args.loops)),
+                temperature=0.0,
+                mode=PYTHON,
+            ),
+            vexx=vexx,
+        )
+    else:
+        gen = generate_maya(
+            reloaded,
+            tok,
+            prompt=prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.0,
+            vexx=vexx,
+            mode=PYTHON,
+        )
 
     summary = {
         "preset": args.preset,
@@ -124,6 +148,9 @@ def main() -> int:
         "val_metrics": state["val_metrics"],
         "test_metrics": test_metrics,
         "sample_generation_provenance": gen.provenance,
+        "generation_loops": gen.num_loops,
+        "adaptive_depth": bool(args.adaptive_depth),
+        "depth_explain": depth_explain,
         "manifest": manifest,
     }
     print(json.dumps(summary, indent=2))
