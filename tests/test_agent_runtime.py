@@ -132,6 +132,12 @@ class TestTools(AgentFixture):
         repo_map = tools.get_repo_map("add returns wrong value", max_tokens=400)
         self.assertIn("pkg/mathx.py", repo_map)
 
+        context = tools.get_repo_context("add returns wrong value", max_tokens=200)
+        self.assertIn("# <|repo_context|>", context)
+        self.assertIn("dense=NOT_RUN", context)
+        self.assertIn("pkg/mathx.py", context)
+        self.assertLessEqual(tools.last_context.tokens_used, 200)
+
     def test_view_is_capped(self):
         tools = self._tools()
         span = tools.view_file_span("pkg/mathx.py", 1, 5000)

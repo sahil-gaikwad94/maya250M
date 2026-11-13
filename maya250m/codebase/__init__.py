@@ -39,7 +39,7 @@ from .repomap import RepoMap, RepoMapBuilder, RepoMapEntry
 from .retrieval import (
     RRF_K,
     DenseRanker,
-    HybridRetriever,
+    HybridRepoRetriever,
     RetrievalCandidate,
     RetrievalContext,
     RetrievalResult,
@@ -87,7 +87,7 @@ __all__ = [
     "RepoMapEntry",
     "RRF_K",
     "DenseRanker",
-    "HybridRetriever",
+    "HybridRepoRetriever",
     "RetrievalCandidate",
     "RetrievalContext",
     "RetrievalResult",

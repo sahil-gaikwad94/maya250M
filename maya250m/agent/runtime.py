@@ -41,12 +41,19 @@ LOOP_GUARD_TEMPLATE = (
     "advance to hypothesis or inspect a different span]"
 )
 
-_READ_TOOLS = {"get_repo_map", "search_repo", "view_file_span", "inspect_symbol_graph"}
+_READ_TOOLS = {
+    "get_repo_map",
+    "get_repo_context",
+    "search_repo",
+    "view_file_span",
+    "inspect_symbol_graph",
+}
 _EDIT_TOOLS = {"apply_patch", "git_revert_file"}
 
 #: Next phase to try after a successful call; applied only when the edge is legal.
 _PHASE_AFTER_TOOL = {
     "get_repo_map": PHASE_REPRODUCE,
+    "get_repo_context": PHASE_REPRODUCE,
     "search_repo": PHASE_REPRODUCE,
     "view_file_span": PHASE_REPRODUCE,
     "inspect_symbol_graph": PHASE_REPRODUCE,
@@ -274,6 +281,9 @@ class AgentRuntime:
 
     def localize(self, query: str, max_tokens: int = 1200) -> ToolObservation:
         return self.call_tool("get_repo_map", query=query, max_tokens=max_tokens)
+
+    def repo_context(self, query: str, max_tokens: int = 1200) -> ToolObservation:
+        return self.call_tool("get_repo_context", query=query, max_tokens=max_tokens)
 
     def search(self, pattern: str, max_hits: int = 20) -> ToolObservation:
         return self.call_tool("search_repo", pattern=pattern, max_hits=max_hits)

@@ -29,7 +29,7 @@ from .repomap import RepoMapBuilder
 __all__ = [
     "RRF_K",
     "DenseRanker",
-    "HybridRetriever",
+    "HybridRepoRetriever",
     "RetrievalCandidate",
     "RetrievalContext",
     "RetrievalResult",
@@ -181,7 +181,7 @@ class RetrievalContext:
         }
 
 
-class HybridRetriever:
+class HybridRepoRetriever:
     """Fuse lexical BM25, structural PPR and an optional dense ranker."""
 
     def __init__(

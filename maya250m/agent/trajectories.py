@@ -38,6 +38,7 @@ RESOLVED_THRESHOLD = 1.0
 
 _READ_ONLY_TOOLS = (
     "get_repo_map",
+    "get_repo_context",
     "search_repo",
     "view_file_span",
     "inspect_symbol_graph",

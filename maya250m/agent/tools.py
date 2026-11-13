@@ -1,4 +1,4 @@
-"""The seven deterministic, resource-bounded agent tools.
+"""The eight deterministic, resource-bounded agent tools.
 
 Every tool is fast, local and returns a structured result. None of them calls a
 network service, an external LLM, or an unbounded subprocess.
@@ -7,6 +7,7 @@ network service, an external LLM, or an unbounded subprocess.
 tool                    bound
 ======================  ==========================================================
 ``get_repo_map``        PPR-ranked skeleton map, ``max_tokens`` default 1500
+``get_repo_context``    fused lexical+graph source spans, ``max_tokens`` default 1500
 ``search_repo``         regex over ``*.py``, ``max_hits`` default 20
 ``view_file_span``      at most 160 numbered lines per call
 ``inspect_symbol_graph`` one symbol: definition, contract, callers, callees
@@ -31,7 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from ..codebase.codegen import PatchError, SearchReplacePatchEngine, parse_patch_blocks
 from ..codebase.indexer import RepoGraphIndexer
 from ..codebase.multifile import build_cross_file_symbol_table
+from ..codebase.packer import FIM_MARKERS
 from ..codebase.repomap import RepoMapBuilder
+from ..codebase.retrieval import HybridRepoRetriever
 from ..verification import VerificationResult, failure, ok
 from .sandbox import Sandbox, SandboxLimits, SandboxPolicy, SandboxViolation
 
@@ -43,6 +46,16 @@ MAX_SEARCH_FILE_BYTES = 400_000
 TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "get_repo_map": {
         "description": "Return a PPR-ranked repository skeleton map for a query.",
+        "parameters": {
+            "query": {"type": "string", "required": True},
+            "max_tokens": {"type": "integer", "default": 1500},
+        },
+    },
+    "get_repo_context": {
+        "description": (
+            "Return fused lexical+graph source spans for a query as read-only "
+            "repo context; names the channels that actually ran."
+        ),
         "parameters": {
             "query": {"type": "string", "required": True},
             "max_tokens": {"type": "integer", "default": 1500},
@@ -174,6 +187,33 @@ class RepoTools:
         if not isinstance(query, str) or not query.strip():
             raise ToolCallError("get_repo_map requires a non-empty query")
         return self.repomap.build(query, token_budget=int(max_tokens)).text
+
+    @property
+    def retriever(self) -> HybridRepoRetriever:
+        """Lazily built hybrid retriever (the symbol graph is not free to build)."""
+        cached = getattr(self, "_retriever", None)
+        if cached is None:
+            cached = HybridRepoRetriever(self.indexer)
+            self._retriever = cached
+        return cached
+
+    def get_repo_context(self, query: str, max_tokens: int = 1500) -> str:
+        """Fused lexical+graph source spans, headed by the channels that ran.
+
+        The header is provenance, not decoration: dense retrieval is reported as
+        ``dense=NOT_RUN`` because no embedding model is attached, so a caller can
+        never mistake this for semantic search that never happened.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ToolCallError("get_repo_context requires a non-empty query")
+        context = self.retriever.render_context(query, token_budget=int(max_tokens))
+        self.last_context = context
+        dense = "dense" if context.dense_ranked else "dense=NOT_RUN"
+        header = (
+            f"{FIM_MARKERS['repo_context']} channels=lexical+structural {dense} "
+            f"spans={len(context.candidates)} truncated={int(context.truncated)}"
+        )
+        return header + ("\n" + context.text if context.text else "")
 
     def search_repo(
         self, pattern: str, file_glob: str = "*.py", max_hits: int = 20

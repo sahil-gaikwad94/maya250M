@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from maya250m.codebase import (
-    HybridRetriever,
+    HybridRepoRetriever,
     RepoGraphIndexer,
     TopologicalRepoPacker,
     bm25_scores,
@@ -106,22 +106,22 @@ class TestReciprocalRankFusion(unittest.TestCase):
         self.assertAlmostEqual(fused["b"], 1.0 / 62)
 
 
-class TestHybridRetriever(RetrievalFixture):
+class TestHybridRepoRetriever(RetrievalFixture):
     def test_lexical_signal_finds_the_named_symbol(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         ranking = retriever.lexical_ranking("normalize_path trailing slash")
         self.assertTrue(ranking)
         names = [retriever._symbols[i].qualname for i in ranking[:3]]
         self.assertIn("normalize_path", names)
 
     def test_structural_signal_follows_the_query_identifiers(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         ranking = retriever.structural_ranking("checksum is returning the wrong digest")
         names = [retriever._symbols[i].qualname for i in ranking[:5]]
         self.assertIn("checksum", names)
 
     def test_dense_signal_absent_means_not_run(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         result = retriever.search("normalize_path", k=5)
         self.assertFalse(result.dense_ranked)
         self.assertEqual(set(result.signals), {"lexical", "structural"})
@@ -135,7 +135,7 @@ class TestHybridRetriever(RetrievalFixture):
                     return [index]
             return []
 
-        retriever = HybridRetriever(self.indexer, dense_ranker=dense)
+        retriever = HybridRepoRetriever(self.indexer, dense_ranker=dense)
         result = retriever.search("registry of names", k=6)
         self.assertTrue(result.dense_ranked)
         self.assertIn("dense", result.signals)
@@ -144,7 +144,7 @@ class TestHybridRetriever(RetrievalFixture):
         self.assertEqual(registry.ranks.get("dense"), 1)
 
     def test_candidates_report_per_signal_ranks(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         result = retriever.search("normalize_path", k=4)
         self.assertTrue(result.candidates)
         for candidate in result.candidates:
@@ -155,7 +155,7 @@ class TestHybridRetriever(RetrievalFixture):
         self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_rendered_context_respects_budget(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         context = retriever.render_context("normalize_path trailing slash", token_budget=60)
         self.assertLessEqual(context.tokens_used, 60)
         self.assertIn("lib/util.py", context.text)
@@ -166,7 +166,7 @@ class TestHybridRetriever(RetrievalFixture):
         self.assertTrue(tiny.truncated)
 
     def test_context_reports_dense_absence(self):
-        retriever = HybridRetriever(self.indexer)
+        retriever = HybridRepoRetriever(self.indexer)
         context = retriever.render_context("checksum", token_budget=200)
         self.assertFalse(context.dense_ranked)
 
