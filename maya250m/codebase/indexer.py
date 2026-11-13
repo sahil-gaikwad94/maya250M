@@ -20,6 +20,8 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from .contracts import CallableContract, contract_from_node
+
 __all__ = [
     "SymbolDef",
     "CallSite",
@@ -66,6 +68,15 @@ class SymbolDef:
     min_arity: int = 0
     max_arity: Optional[int] = 0
     return_type: str = "any"
+    binding: str = "function"
+    confidence: str = "exact_ast"
+    contract: Optional[Dict[str, Any]] = None
+
+    def callable_contract(self) -> Optional[CallableContract]:
+        """Typed contract, or ``None`` for legacy index payloads."""
+        if not self.contract:
+            return None
+        return CallableContract.from_dict(self.contract)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -365,7 +376,8 @@ class RepoGraphIndexer:
                         kind = "async_method" if is_method else "async_function"
                     else:
                         kind = "method" if is_method else "function"
-                    min_arity, max_arity = _arity(stmt)
+                    contract = contract_from_node(stmt, rel, class_prefix)
+                    min_arity, max_arity = contract.positional_bounds()
                     returns = stmt.returns
                     node.symbols.append(
                         SymbolDef(
@@ -382,6 +394,9 @@ class RepoGraphIndexer:
                             min_arity=min_arity,
                             max_arity=max_arity,
                             return_type=ast.unparse(returns) if returns is not None else "any",
+                            binding=contract.binding,
+                            confidence=contract.confidence,
+                            contract=contract.to_dict(),
                         )
                     )
                     node.calls.extend(self._collect_call_sites(stmt, rel, qualname))
@@ -478,23 +493,70 @@ class RepoGraphIndexer:
         node = self.files.get(rel_path.replace(os.sep, "/"))
         return list(node.symbols) if node else []
 
+    def contract_for(self, qualname: str) -> Optional[CallableContract]:
+        """Typed contract for one qualified name (``None`` if absent/legacy)."""
+        for symbol in self.definitions(qualname):
+            contract = symbol.callable_contract()
+            if contract is not None:
+                return contract
+        return None
+
     def signature_table(self, names: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, Any]]:
-        """``name -> {min_arity, max_arity, return_type}`` for Vexx in-flight masking."""
+        """``name -> contract entry`` for Vexx in-flight masking.
+
+        Entries keep the v2 ``min_arity`` / ``max_arity`` / ``return_type`` keys and
+        add binding, keyword-only names and confidence. Same-named definitions in
+        different classes are merged to the *widest* bounds and flagged ambiguous,
+        never silently collapsed to one class.
+        """
+        selected = set(names) if names is not None else None
         table: Dict[str, Dict[str, Any]] = {}
         for name, symbols in self._by_name.items():
-            if names is not None and name not in set(names):
+            if selected is not None and name not in selected:
                 continue
             concrete = [s for s in symbols if s.kind != "class"]
             if not concrete:
                 continue
-            # Prefer the shallowest definition; ambiguous names get the widest bounds.
             concrete.sort(key=lambda s: (s.qualname.count("."), s.file_path))
-            mins = [s.min_arity for s in concrete]
+            mins = [int(s.min_arity) for s in concrete]
             maxes = [s.max_arity for s in concrete]
+            contracts = [s.contract for s in concrete if s.contract]
+            keyword_only = sorted(
+                {
+                    param["name"]
+                    for contract in contracts
+                    for param in contract.get("parameters") or []
+                    if param.get("kind") == "keyword_only"
+                }
+            )
+            ambiguous = len({s.qualname for s in concrete}) > 1
             table[name] = {
                 "min_arity": min(mins),
                 "max_arity": None if any(m is None for m in maxes) else max(maxes),
                 "return_type": concrete[0].return_type or "any",
+                "binding": concrete[0].binding,
+                "confidence": (
+                    "exact_ast"
+                    if all(s.confidence == "exact_ast" for s in concrete)
+                    else "partial_ast"
+                ),
+                "keyword_only": keyword_only,
+                "required_keywords": [] if ambiguous else [
+                    param["name"]
+                    for param in (contracts[0].get("parameters") if contracts else []) or []
+                    if param.get("kind") == "keyword_only" and param.get("required")
+                ],
+                "has_var_keyword": any(
+                    param.get("kind") == "var_keyword"
+                    for contract in contracts
+                    for param in contract.get("parameters") or []
+                ),
+                "has_var_positional": any(
+                    param.get("kind") == "var_positional"
+                    for contract in contracts
+                    for param in contract.get("parameters") or []
+                ),
+                "ambiguous": ambiguous,
             }
         return table
 

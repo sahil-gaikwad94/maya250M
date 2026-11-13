@@ -112,7 +112,13 @@ def generate_maya(
         truncated = True
     input_ids = torch.tensor([ids], dtype=torch.long)
 
-    logits, cache, truncation_info = model.prefill(input_ids, num_loops=num_loops)
+    logits, cache, truncation_info = model.prefill(
+        input_ids,
+        num_loops=num_loops,
+        tokenizer_hash=tokenizer.tokenizer_hash()
+        if hasattr(tokenizer, "tokenizer_hash")
+        else None,
+    )
     loops_used = int(truncation_info.get("num_loops", 0))
     seq_start = int(input_ids.shape[1]) - truncation_info["tokens_dropped"]
 

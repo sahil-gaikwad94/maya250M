@@ -40,6 +40,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .cache import (
+    CACHE_SCHEMA_VERSION,
+    LEGACY_CACHE_SCHEMA_VERSION,
+    CacheIdentityError,
+    build_identity,
+    stamp_bundle,
+    validate_bundle,
+)
+
 from .config import get_config, validate_config
 from .tokenizer import BPETokenizer
 
@@ -972,6 +981,7 @@ class MayaModel(nn.Module):
         input_ids: torch.Tensor,
         doc_ids: Optional[torch.Tensor] = None,
         num_loops: Optional[int] = None,
+        tokenizer_hash: Optional[str] = None,
     ) -> Tuple[torch.Tensor, dict, dict]:
         """Loop-consistent prefill matching ``MayaModel.forward()`` for any ``num_loops >= 1``.
 
@@ -1022,16 +1032,32 @@ class MayaModel(nn.Module):
         logits = self._project_logits(h)
 
         eff_len = int(input_ids.shape[1])
-        cache_bundle = {
-            "schema_version": 2,
-            "num_loops": loops,
-            "position": eff_len,
-            "batch_size": int(input_ids.shape[0]),
-            "config_hash": self.config_hash(),
-            "prelude": prelude_caches,
-            "core_loops": core_loops_caches,
-            "coda": coda_caches,
-        }
+        identity = build_identity(
+            self, batch_size=int(input_ids.shape[0]), num_loops=loops, dtype=x.dtype
+        )
+        if tokenizer_hash is not None:
+            from dataclasses import replace as _replace
+
+            identity = _replace(identity, tokenizer_hash=tokenizer_hash)
+        cache_bundle = stamp_bundle(
+            {
+                "num_loops": loops,
+                "position": eff_len,
+                "batch_size": int(input_ids.shape[0]),
+                "config_hash": self.config_hash(),
+                "prelude": prelude_caches,
+                "core_loops": core_loops_caches,
+                "coda": coda_caches,
+                "doc_state": {
+                    "last_doc_id": (
+                        [int(v) for v in doc_ids[:, -1].tolist()]
+                        if doc_ids is not None
+                        else None
+                    )
+                },
+            },
+            identity,
+        )
         info = {
             "truncated": truncated,
             "tokens_dropped": dropped,
@@ -1053,14 +1079,26 @@ class MayaModel(nn.Module):
         BUG-01 fix: mirrors ``forward()``/``prefill()`` for any loop count, using the
         per-loop ``schema_version = 2`` cache topology.
         """
-        if not isinstance(cache_bundle, dict) or cache_bundle.get("schema_version") != 2:
-            raise ValueError(
-                "Invalid or obsolete hybrid cache schema; expected schema_version=2 dict"
-            )
+        schema = validate_bundle(cache_bundle, allow_legacy=True)
         if cache_bundle.get("config_hash") != self.config_hash():
-            raise ValueError("Hybrid cache config_hash mismatch with live MayaModel")
+            raise CacheIdentityError(
+                "hybrid cache config_hash mismatch with live MayaModel"
+            )
+        if int(cache_bundle.get("batch_size", -1)) != int(token_id.shape[0]):
+            raise CacheIdentityError(
+                f"cache batch_size {cache_bundle.get('batch_size')} != token batch "
+                f"{int(token_id.shape[0])}"
+            )
 
         loops = int(cache_bundle["num_loops"])
+        if len(cache_bundle.get("core_loops") or []) != loops:
+            raise CacheIdentityError(
+                f"cache has {len(cache_bundle.get('core_loops') or [])} core-loop passes "
+                f"but declares num_loops={loops}"
+            )
+        if schema == LEGACY_CACHE_SCHEMA_VERSION:
+            # Legacy schema-2 bundles remain readable; new bundles are schema 3.
+            pass
         pos = int(cache_bundle["position"] if seq_start is None else seq_start)
         p_end = self.prelude_layers
         c_end = p_end + self.core_layers
@@ -1099,16 +1137,30 @@ class MayaModel(nn.Module):
 
         h = rms_norm_fp32(x, self.norm, self.norm_eps, self.zc)
         logits = self._project_logits(h)[:, -1, :]
-        new_bundle = {
-            "schema_version": 2,
-            "num_loops": loops,
-            "position": pos + int(token_id.shape[1]),
-            "batch_size": int(token_id.shape[0]),
-            "config_hash": self.config_hash(),
-            "prelude": new_prelude,
-            "core_loops": new_core_loops,
-            "coda": new_coda,
-        }
+        from dataclasses import replace as _replace
+
+        identity = build_identity(
+            self,
+            batch_size=int(token_id.shape[0]),
+            num_loops=loops,
+            dtype=x.dtype,
+            checkpoint_sha256=cache_bundle.get("checkpoint_sha256"),
+        )
+        if cache_bundle.get("tokenizer_hash") is not None:
+            identity = _replace(identity, tokenizer_hash=cache_bundle.get("tokenizer_hash"))
+        new_bundle = stamp_bundle(
+            {
+                "num_loops": loops,
+                "position": pos + int(token_id.shape[1]),
+                "batch_size": int(token_id.shape[0]),
+                "config_hash": self.config_hash(),
+                "prelude": new_prelude,
+                "core_loops": new_core_loops,
+                "coda": new_coda,
+                "doc_state": dict(cache_bundle.get("doc_state") or {}),
+            },
+            identity,
+        )
         if return_hidden:
             return logits, new_bundle, h
         return logits, new_bundle
@@ -1135,8 +1187,30 @@ def create_empty_hybrid_cache_v2(
     }
 
 
+def create_empty_hybrid_cache_v3(
+    model: "MayaModel", num_loops: Optional[int] = None, batch_size: int = 1
+) -> dict:
+    """Create an empty schema-3 cache stamped with the live model's identity."""
+    loops = int(num_loops if num_loops is not None else model.recurrent_loops)
+    bundle = create_empty_hybrid_cache_v2(
+        loops,
+        model.prelude_layers,
+        model.core_layers,
+        model.coda_layers,
+        int(batch_size),
+        model.config_hash(),
+    )
+    identity = build_identity(
+        model,
+        batch_size=int(batch_size),
+        num_loops=loops,
+        dtype=next(model.parameters()).dtype,
+    )
+    return stamp_bundle(bundle, identity)
+
+
 def clone_hybrid_cache(cache):
-    """Recursively deep-copy v1 flat list caches or v2 structured multi-loop caches."""
+    """Recursively deep-copy v1 flat list caches or v2/v3 structured caches."""
     if isinstance(cache, torch.Tensor):
         return cache.clone()
     if isinstance(cache, list):

@@ -33,6 +33,7 @@ from ..codebase.indexer import RepoGraphIndexer
 from ..codebase.multifile import build_cross_file_symbol_table
 from ..codebase.repomap import RepoMapBuilder
 from ..verification import VerificationResult, failure, ok
+from .sandbox import Sandbox, SandboxLimits, SandboxPolicy, SandboxViolation
 
 __all__ = ["RepoTools", "TOOL_SCHEMAS", "ToolCallError"]
 
@@ -76,11 +77,15 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
     "run_tests": {
-        "description": "Run unittest/pytest in an isolated subprocess and summarize failures.",
+        "description": "Run pytest in a sandboxed subprocess and summarize failures.",
         "parameters": {
             "test_target": {"type": "string", "default": "tests/"},
             "timeout_s": {"type": "number", "default": 10.0},
         },
+    },
+    "apply_patch_set": {
+        "description": "Apply a multi-file SEARCH/REPLACE set atomically (all or nothing).",
+        "parameters": {"patch_text": {"type": "string", "required": True}},
     },
     "git_revert_file": {
         "description": "Restore one file to its task-start snapshot.",
@@ -118,14 +123,26 @@ class RepoTools:
     pytest_target: str = "tests/"
     snapshot_dir: Optional[str] = None
     memory_limit_mb: int = 512
+    sandbox: Optional[Sandbox] = None
+    allow_test_edits: bool = False
     _snapshot: Dict[str, bytes] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.root = os.path.abspath(self.root or self.indexer.root)
         self.engine = SearchReplacePatchEngine(
-            indexer=self.indexer, vexx=self.vexx, root=self.root
+            indexer=self.indexer,
+            vexx=self.vexx,
+            root=self.root,
+            allow_test_edits=self.allow_test_edits,
         )
         self.repomap = RepoMapBuilder(self.indexer)
+        if self.sandbox is None:
+            self.sandbox = Sandbox(
+                SandboxPolicy(
+                    root=self.root,
+                    limits=SandboxLimits(memory_mb=self.memory_limit_mb),
+                )
+            )
         if not self._snapshot:
             self.take_snapshot()
 
@@ -258,9 +275,17 @@ class RepoTools:
             file_path, search_block, replace_block, commit=True
         )
 
+    def apply_patch_set(self, patch_text: str) -> VerificationResult:
+        """Apply a multi-file patch as one atomic, test-tamper-protected transaction."""
+        return self.engine.apply_patch_text_transactional(patch_text, commit=True)
+
     def run_tests(
         self, test_target: str = "", timeout_s: float = 10.0, memory_limit_mb: Optional[int] = None
     ) -> VerificationResult:
+        if self.sandbox is not None:
+            return self._run_tests_sandboxed(
+                test_target or self.pytest_target, timeout_s, memory_limit_mb
+            )
         target = test_target or self.pytest_target
         env = dict(os.environ)
         env["PYTHONPATH"] = self.root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -315,6 +340,71 @@ class RepoTools:
             summary["headline"],
             output_tail=summary["tail"],
             failing_tests=summary["failing"],
+        )
+
+    def _run_tests_sandboxed(
+        self,
+        target: str,
+        timeout_s: float,
+        memory_limit_mb: Optional[int],
+    ) -> VerificationResult:
+        """Run pytest inside the sandbox: scrubbed env, limits, write audit."""
+        command = [sys.executable, "-B", "-m", "pytest", "-q", target, "--no-header"]
+        if memory_limit_mb is not None:
+            self.sandbox.policy = SandboxPolicy(
+                root=self.root,
+                writable_roots=self.sandbox.policy.writable_roots,
+                limits=SandboxLimits(
+                    memory_mb=int(memory_limit_mb),
+                    cpu_seconds=max(2, int(timeout_s) + 5),
+                    wall_seconds=max(5.0, float(timeout_s) + 5.0),
+                ),
+            )
+        try:
+            run = self.sandbox.run(
+                command, cwd=self.root, timeout=float(timeout_s) + 5.0
+            )
+        except SandboxViolation as exc:
+            return failure("sandbox_error", exc.message, **exc.details)
+
+        if "No module named pytest" in run.output:
+            command = [
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                target,
+            ]
+            try:
+                run = self.sandbox.run(
+                    command, cwd=self.root, timeout=float(timeout_s) + 5.0
+                )
+            except SandboxViolation as exc:
+                return failure("sandbox_error", exc.message, **exc.details)
+
+        details = {
+            "command": " ".join(command[:4]),
+            "sandbox": run.to_dict(),
+        }
+        if run.timed_out:
+            return failure(
+                "test_timeout", f"test run exceeded {timeout_s:.1f}s", **details
+            )
+        if run.returncode == 0:
+            return ok(
+                "tests passed",
+                output_tail=run.output.strip().splitlines()[-5:],
+                **details,
+            )
+        summary = self._summarize_test_output(run.output)
+        return failure(
+            "tests_failed",
+            summary["headline"],
+            output_tail=summary["tail"],
+            failing_tests=summary["failing"],
+            **details,
         )
 
     @staticmethod

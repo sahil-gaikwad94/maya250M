@@ -57,6 +57,17 @@ try:
         sample_next,
         top_p_filter,
     )
+    from .cache import (
+        CACHE_SCHEMA_VERSION,
+        CacheIdentity,
+        CacheIdentityError,
+        CacheRewindError,
+        CacheSnapshotStore,
+        cache_memory_ledger,
+        cache_memory_table,
+        rewind_cache,
+        validate_bundle,
+    )
     from .model import (
         DifferentialGatedCausalAttention,
         GatedDeltaNetLayer,
@@ -67,6 +78,7 @@ try:
         build_maya_model,
         clone_hybrid_cache,
         create_empty_hybrid_cache_v2,
+        create_empty_hybrid_cache_v3,
         hash_config,
         rms_norm_fp32,
         truncate_hybrid_cache_at_token,

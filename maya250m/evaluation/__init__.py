@@ -30,6 +30,29 @@ from .identity import (
     MeasurementIdentity,
     MeasurementStatus,
 )
+from .contamination import (
+    ContaminationError,
+    ContaminationReport,
+    assert_no_contamination,
+    contamination_scan,
+    detect_contamination,
+    exact_containment,
+    ngram_overlap,
+    ngram_set,
+    protect_heldout,
+    scan_contamination,
+)
+from .repo_ordering_ablation import (
+    GDN_RETRIEVAL_CLAIM,
+    LocalizationQuery,
+    OrderingCondition,
+    ORDERING_CONDITIONS,
+    metrics_from_ranking,
+    rank_files,
+    build_queries,
+    run_ordering_ablation,
+    AblationReport,
+)
 
 __all__ = [
     "ABLATIONS",
@@ -54,4 +77,14 @@ __all__ = [
     "MeasurementError",
     "MeasurementIdentity",
     "MeasurementStatus",
+    "ContaminationError",
+    "ContaminationReport",
+    "assert_no_contamination",
+    "contamination_scan",
+    "detect_contamination",
+    "exact_containment",
+    "ngram_overlap",
+    "ngram_set",
+    "protect_heldout",
+    "scan_contamination",
 ]

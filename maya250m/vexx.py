@@ -244,59 +244,89 @@ class Vexx35Controller:
 
     @classmethod
     def extract_ast_symbol_table(cls, code_text: str) -> Dict[str, Dict[str, Any]]:
-        """Extract single-line, multi-line, ``async def`` and class-method signatures.
+        """Full calling-convention contracts for complete or in-flight code.
 
-        BUG-09 fix: the previous single-line scanner missed multi-line signatures,
-        coroutines, and indented class methods, so in-flight masking blocked valid
-        calls in real multi-file codebases.
+        v3 upgrade: replaces the v2 arity approximation. ``**kwargs`` no longer
+        grants unbounded *positional* arity, required keyword-only arguments are
+        tracked, ``self``/``cls``/``staticmethod`` binding is modelled, and methods
+        with the same unqualified name in different classes are merged to the
+        widest bounds and flagged ``ambiguous`` instead of being collapsed.
+
+        Complete source uses ``ast`` (``exact_ast``). In-flight text uses a
+        balanced-delimiter header scan (``partial_ast``); unrecoverable headers are
+        reported as ``unknown`` rather than guessed.
         """
+        from .codebase.contracts import build_contracts, header_contract_from_text
+
         extracted: Dict[str, Dict[str, Any]] = {}
-        # 1. Prefer a full-file parse when the candidate/in-flight text is complete.
         try:
-            full_tree = ast.parse(code_text)
+            grouped = build_contracts(code_text, module="<inline>")
         except (SyntaxError, ValueError):
-            full_tree = None
-        if full_tree is not None:
-            for node in ast.walk(full_tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    cls._record_func_node(node, extracted)
+            grouped = None
+
+        if grouped is not None:
+            for contracts in grouped.values():
+                for contract in contracts:
+                    cls._record_contract(contract, extracted)
             return extracted
 
-        # 2. Fallback for partially generated code: match multi-line (async )?def headers.
-        header_pat = re.compile(
-            r"(?:^[ \t]*|\n[ \t]*)(?:async[ \t]+)?def[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
-            r"\([^()]*\)[ \t]*(?:->[ \t]*[^:\n]+)?[ \t]*:",
-            re.DOTALL,
-        )
-        for match in header_pat.finditer(code_text):
-            raw_hdr = match.group(0).lstrip()
-            try:
-                tree = ast.parse(raw_hdr + "\n    pass")
-            except (SyntaxError, ValueError):
-                continue
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    cls._record_func_node(node, extracted)
+        for match in re.finditer(
+            r"(?:^|\n)[ \t]*(?:async[ \t]+)?def[ \t]+[A-Za-z_]\w*[ \t]*\(",
+            code_text,
+        ):
+            contract = header_contract_from_text(
+                code_text[match.start() :], symbol_id="<inline>"
+            )
+            if contract is not None:
+                cls._record_contract(contract, extracted)
         return extracted
 
     @staticmethod
-    def _record_func_node(node: ast.AST, table: Dict[str, Dict[str, Any]]) -> None:
-        """Record one function/method signature (arity bounds + return type) into ``table``."""
-        args_obj = getattr(node, "args", None)
-        if args_obj is None:
+    def _record_contract(contract, table: Dict[str, Dict[str, Any]]) -> None:
+        """Merge one contract entry into a name-keyed symbol table."""
+        if contract.confidence == "unknown":
+            # Never install a guessed (0,0) contract: it would mask every valid call.
             return
-        pos_args = [a.arg for a in args_obj.args]
-        if pos_args and pos_args[0] in ("self", "cls"):
-            pos_args = pos_args[1:]
-        n_pos = len(pos_args)
-        n_def = len(args_obj.defaults)
-        has_vararg = args_obj.vararg is not None or args_obj.kwarg is not None
-        returns = getattr(node, "returns", None)
-        table[getattr(node, "name", "")] = {
-            "min_arity": max(0, n_pos - n_def),
-            "max_arity": None if has_vararg else n_pos,
-            "return_type": ast.unparse(returns) if returns is not None else "any",
-        }
+        name = contract.symbol_id.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        entry = contract.to_symbol_table_entry()
+        entry["partial"] = contract.confidence != "exact_ast"
+        existing = table.get(name)
+        if existing is None:
+            table[name] = entry
+            return
+
+        maxes = [existing.get("max_arity"), entry.get("max_arity")]
+        merged = dict(existing)
+        merged.update(
+            {
+                "min_arity": min(
+                    int(existing.get("min_arity", 0)), int(entry.get("min_arity", 0))
+                ),
+                "max_arity": (
+                    None
+                    if any(maximum is None for maximum in maxes)
+                    else max(int(maximum) for maximum in maxes)
+                ),
+                "has_var_keyword": bool(existing.get("has_var_keyword"))
+                or bool(entry.get("has_var_keyword")),
+                "has_var_positional": bool(existing.get("has_var_positional"))
+                or bool(entry.get("has_var_positional")),
+                "keyword_only": sorted(
+                    set(existing.get("keyword_only") or [])
+                    | set(entry.get("keyword_only") or [])
+                ),
+                # Ambiguous overloads must not *demand* a keyword argument.
+                "required_keywords": [],
+                "return_type": (
+                    existing.get("return_type")
+                    if existing.get("return_type") == entry.get("return_type")
+                    else "any"
+                ),
+                "ambiguous": True,
+                "partial": bool(existing.get("partial")) or bool(entry.get("partial")),
+            }
+        )
+        table[name] = merged
 
     @staticmethod
     def _lex_code_state(code_prefix: str) -> Dict[str, Any]:

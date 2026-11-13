@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..verification import VerificationResult, failure, ok
+from .contracts import CallableContract, check_call
 from .indexer import RepoGraphIndexer, SymbolDef
 
 __all__ = [
@@ -120,12 +121,46 @@ def verify_cross_file_impact(
                 )
             continue
 
-        min_arity = int(contract.get("min_arity", 0))
-        max_arity = contract.get("max_arity", None)
+        typed: Optional[CallableContract] = None
+        unverified = 0
+        if isinstance(contract.get("parameters"), (list, tuple)):
+            typed = CallableContract.from_dict(contract)
+
         for site in callers:
+            if typed is not None:
+                if not _attribute_call_is_statically_bound(site, indexer):
+                    unverified += 1
+                    continue
+                check = check_call(
+                    typed,
+                    n_positional=int(site.n_positional),
+                    keyword_names=list(site.keyword_names),
+                    has_starargs=bool(site.has_starargs),
+                    has_kwargs=bool(site.has_kwargs),
+                )
+                if check.passed or check.status == "unknown_dynamic_dispatch":
+                    continue
+                breakages.append(
+                    {
+                        "symbol": name,
+                        "caller_file": site.file_path,
+                        "line": site.line,
+                        "caller": site.caller_qualname,
+                        "n_positional": int(site.n_positional),
+                        "keyword_names": list(site.keyword_names),
+                        "kind": check.kind,
+                        "status": check.status,
+                        "message": check.message,
+                    }
+                )
+                continue
+
+            # Legacy contract dicts (no full parameter list) only carry arity.
             if site.has_starargs or site.has_kwargs:
                 # Cannot statically prove a break: report as *unverified*, not failed.
                 continue
+            min_arity = int(contract.get("min_arity", 0))
+            max_arity = contract.get("max_arity", None)
             n_args = int(site.n_positional)
             if n_args < min_arity or (max_arity is not None and n_args > max_arity):
                 breakages.append(
@@ -148,17 +183,58 @@ def verify_cross_file_impact(
         )
     if breakages:
         first = breakages[0]
+        if "status" in first:
+            detail = first.get("message") or first["status"]
+        else:
+            detail = (
+                f"passes {first['n_positional']} positional arg(s) but the contract is "
+                f"[{first['min_arity']}, {first['max_arity']}]"
+            )
         return failure(
             "cross_file_arity_breakage",
             (
                 f"{len(breakages)} call site(s) break the new signature of "
                 f"{first['symbol']!r}; first: {first['caller_file']}:{first['line']} "
-                f"passes {first['n_positional']} positional arg(s) but the contract is "
-                f"[{first['min_arity']}, {first['max_arity']}]"
+                f"{detail}"
             ),
             violations=breakages[:max_reported],
+            unverified_arity_checks=unverified,
         )
     return ok("no cross-file contract violations", checked_symbols=len(changed_signatures))
+
+
+def _attribute_call_is_statically_bound(site: CallSite, indexer: RepoGraphIndexer) -> bool:
+    """Only trust ``a.b(...)`` when the receiver is statically known.
+
+    ``self.f`` / ``cls.f``, an imported module, or a class defined in the file can
+    be resolved. A local variable, a parameter or a return value is dynamic
+    dispatch: the call is counted as *unverified* rather than rejected.
+    """
+    callee = getattr(site, "callee", "")
+    if "." not in callee:
+        return True
+    prefix, _, receiver = callee.rpartition(".")
+    if receiver in ("self", "cls"):
+        return True
+    if prefix.split(".")[-1] == "super":
+        return True
+    node = indexer.files.get(site.file_path)
+    if node is None:
+        return False
+    for imported in getattr(node, "imports", []) or []:
+        imported = str(imported)
+        base = imported.rstrip("/").rsplit("/", 1)[-1]
+        if base == "__init__.py":
+            parts = imported.rstrip("/").split("/")
+            base = parts[-2] if len(parts) > 1 else ""
+        if base.removesuffix(".py") == receiver:
+            return True
+        if imported.removesuffix(".py") == prefix.replace(".", "/"):
+            return True
+    for symbol in getattr(node, "symbols", []) or []:
+        if symbol.kind == "class" and symbol.name == receiver:
+            return True
+    return False
 
 
 def call_chain(

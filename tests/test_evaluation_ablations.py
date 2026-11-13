@@ -136,7 +136,7 @@ class TestHarness(unittest.TestCase):
 
 class TestAblationMatrix(unittest.TestCase):
     def test_sixteen_named_ablations(self):
-        self.assertEqual(sorted(ABLATIONS), [chr(ord("A") + i) for i in range(16)])
+        self.assertEqual(sorted(ABLATIONS), [chr(ord("A") + i) for i in range(26)])
         for key, spec in ABLATIONS.items():
             self.assertTrue(spec.name)
             self.assertTrue(spec.description)
@@ -156,12 +156,12 @@ class TestAblationMatrix(unittest.TestCase):
         self.assertEqual(reduced["recurrent_loops"], 1)
 
         with self.assertRaises(KeyError):
-            apply_ablation(base, "Z")
+            apply_ablation(base, "ZZ")
 
     def test_every_ablation_produces_a_valid_config(self):
         for preset in ("MAYA_TINY_TEST", "MAYA_250M"):
             rows = ablation_table(preset)
-            self.assertEqual(len(rows), 16)
+            self.assertEqual(len(rows), 26)
             self.assertTrue(all(row["valid_config"] for row in rows), preset)
 
     def test_unrun_ablation_has_no_metric(self):

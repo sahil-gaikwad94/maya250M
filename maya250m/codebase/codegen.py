@@ -169,30 +169,33 @@ def apply_search_replace(text: str, search: str, replace: str) -> str:
 
 
 def _signature_table_from_source(source: str) -> Dict[str, Dict[str, Any]]:
-    """Per-function contracts from a source string (for old/new comparison)."""
+    """Per-function contracts from a source string (for old/new comparison).
+
+    Returns the union of the v2 arity view and the full parameter contract, so a
+    change to a keyword-only argument or a default is detected too — not just a
+    change in positional arity.
+    """
+    from .contracts import build_contracts
+
     table: Dict[str, Dict[str, Any]] = {}
     try:
-        tree = ast.parse(source)
+        grouped = build_contracts(source)
     except SyntaxError:
         return table
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        args = node.args
-        positional = list(args.posonlyargs) + list(args.args)
-        if positional and positional[0].arg in ("self", "cls"):
-            positional = positional[1:]
-        n_pos = len(positional)
-        n_def = len(args.defaults)
-        has_vararg = args.vararg is not None or args.kwarg is not None
-        kw_required = sum(
-            1 for arg, default in zip(args.kwonlyargs, args.kw_defaults) if default is None
+    for qualname, contracts in grouped.items():
+        name = qualname.rsplit(".", 1)[-1]
+        implemented = [c for c in contracts if c.overload_group is None] or contracts
+        contract = implemented[-1]
+        entry = contract.to_symbol_table_entry()
+        entry.update(
+            {
+                "symbol_id": contract.symbol_id,
+                "parameters": [p.to_dict() for p in contract.parameters],
+                "return_annotation": contract.return_annotation,
+                "overload_group": contract.overload_group,
+            }
         )
-        table[node.name] = {
-            "min_arity": max(0, n_pos - n_def),
-            "max_arity": None if has_vararg else n_pos + kw_required,
-            "return_type": ast.unparse(node.returns) if node.returns is not None else "any",
-        }
+        table[name] = entry
     return table
 
 
@@ -204,6 +207,7 @@ class SearchReplacePatchEngine:
     vexx: Any = None
     root: Optional[str] = None
     check_cross_file: bool = True
+    allow_test_edits: bool = False
     last_new_text: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -237,6 +241,15 @@ class SearchReplacePatchEngine:
     ) -> VerificationResult:
         """Verify the patch on a buffer, then optionally write it atomically."""
         rel_path = file_path.replace("\\", "/")
+        if not self.allow_test_edits:
+            from .transaction import is_test_path
+
+            if is_test_path(rel_path):
+                return failure(
+                    "test_tampering_blocked",
+                    f"refusing to edit test file {rel_path!r} without explicit permission",
+                    file_path=rel_path,
+                )
         try:
             original = self.read(file_path)
         except OSError as exc:
@@ -322,6 +335,37 @@ class SearchReplacePatchEngine:
             committed=bool(commit),
             changed_lines=replace.count("\n") + 1,
         )
+
+    def apply_patch_text_transactional(
+        self,
+        patch_text: str,
+        commit: bool = False,
+        default_file: str = "",
+    ) -> VerificationResult:
+        """Parse and apply one patch text as a single atomic transaction."""
+        from .transaction import PatchTransaction
+
+        try:
+            transaction = PatchTransaction.from_patch_text(
+                patch_text,
+                root=self.root or ".",
+                default_file=default_file,
+                indexer=self.indexer,
+                vexx=self.vexx,
+                allow_test_edits=self.allow_test_edits,
+            )
+        except PatchError as exc:
+            return failure(exc.category, exc.message, **exc.details)
+        result = transaction.execute(commit=commit)
+        if result.passed:
+            self.history.append(
+                {
+                    "file_path": ",".join(result.details.get("files") or []),
+                    "committed": bool(result.details.get("committed")),
+                    "transactional": True,
+                }
+            )
+        return result
 
     def apply_patch_text(
         self,

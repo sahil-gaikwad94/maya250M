@@ -34,6 +34,8 @@ FAILURE_CATEGORIES = (
     "test_timeout",
     "cross_file_arity_breakage",
     "cross_file_missing_symbol",
+    "test_tampering_blocked",
+    "transaction_conflict",
     "wrong_answer",
     "missing_constraint",
     "ambiguous_request",

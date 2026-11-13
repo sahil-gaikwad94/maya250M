@@ -174,7 +174,7 @@ class TestPhase0BRegressions(unittest.TestCase):
             def eval(self):
                 return self
 
-            def prefill(self, input_ids, doc_ids=None, num_loops=None):
+            def prefill(self, input_ids, doc_ids=None, num_loops=None, tokenizer_hash=None):
                 b, n = input_ids.shape
                 logits = torch.full((b, tok.vocab_size), -1e4)
                 logits[:, eq_id] = 0.0

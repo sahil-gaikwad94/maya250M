@@ -26,6 +26,9 @@ __all__ = [
     "run_ablation",
     "run_ablation_matrix",
     "ablation_table",
+    "ablation_compute_multiplier",
+    "match_compute",
+    "compute_matched_pairs",
 ]
 
 
@@ -38,6 +41,7 @@ class AblationSpec:
     description: str
     disables: Tuple[str, ...] = ()
     config_overrides: Dict[str, Any] = field(default_factory=dict)
+    compute_multiplier: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -46,6 +50,7 @@ class AblationSpec:
             "description": self.description,
             "disables": list(self.disables),
             "config_overrides": dict(self.config_overrides),
+            "compute_multiplier": float(self.compute_multiplier),
         }
 
 
@@ -106,6 +111,56 @@ ABLATIONS: Dict[str, AblationSpec] = {
         "P", "no_verification_gate",
         "Accept the first patch without AST/policy/test verification.",
         ("verification_gate",),
+    ),
+    "Q": AblationSpec(
+        "Q", "no_data_dedup",
+        "Skip exact/normalized/near-duplicate and clone deduplication of training data.",
+        ("data_dedup",), compute_multiplier=1.0,
+    ),
+    "R": AblationSpec(
+        "R", "no_provenance_tracking",
+        "Train on records without source/license/domain provenance.",
+        ("provenance",), compute_multiplier=1.0,
+    ),
+    "S": AblationSpec(
+        "S", "no_contamination_guard",
+        "Do not scan or remove benchmark/contaminated training records.",
+        ("contamination_guard",), compute_multiplier=1.0,
+    ),
+    "T": AblationSpec(
+        "T", "no_domain_mixture",
+        "Single-domain training instead of the declared mixture.",
+        ("domain_mixture",), compute_multiplier=1.0,
+    ),
+    "U": AblationSpec(
+        "U", "no_repo_ordering",
+        "Random file ordering when packing repositories into context.",
+        ("repo_ordering",), compute_multiplier=1.0,
+    ),
+    "V": AblationSpec(
+        "V", "no_sandbox_isolation",
+        "Run agent tools without the filesystem/network sandbox.",
+        ("sandbox",), compute_multiplier=1.0,
+    ),
+    "W": AblationSpec(
+        "W", "no_typed_firewall",
+        "Feed raw tool output without typed message separation.",
+        ("typed_firewall",), compute_multiplier=1.0,
+    ),
+    "X": AblationSpec(
+        "X", "no_signature_contracts",
+        "Skip Python signature/arity verification before commit.",
+        ("signature_contracts",), compute_multiplier=1.0,
+    ),
+    "Y": AblationSpec(
+        "Y", "no_atomic_transactions",
+        "Apply patches file-by-file without transactional rollback.",
+        ("atomic_transactions",), compute_multiplier=1.0,
+    ),
+    "Z": AblationSpec(
+        "Z", "no_cache_identity",
+        "Use a legacy cache without schema/identity validation.",
+        ("cache_identity",), compute_multiplier=1.0,
     ),
 }
 
@@ -222,6 +277,37 @@ def run_ablation_matrix(
         for key in selected
     ]
 
+
+
+def ablation_compute_multiplier(key: str) -> float:
+    """Return the declared relative compute multiplier for an ablation."""
+    if key not in ABLATIONS:
+        raise KeyError(f"unknown ablation {key!r}")
+    return float(ABLATIONS[key].compute_multiplier)
+
+
+def match_compute(base_config: Dict[str, Any], key: str) -> Dict[str, Any]:
+    """Return a config copy annotated with compute-matching metadata.
+
+    Removing a component must not be compared at a different compute budget;
+    this helper records the multiplier so runners can pad or normalise FLOPs
+    rather than silently changing the budget.
+    """
+    cfg = apply_ablation(base_config, key)
+    cfg["_compute_multiplier"] = ablation_compute_multiplier(key)
+    cfg["_ablation"] = key
+    return cfg
+
+
+def compute_matched_pairs(base_config: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Pairs of (ablation, reference) that share a compute multiplier."""
+    pairs: List[Tuple[str, str]] = []
+    for key, spec in ABLATIONS.items():
+        if key == "A":
+            continue
+        if abs(spec.compute_multiplier - 1.0) < 1e-9:
+            pairs.append((key, "A"))
+    return pairs
 
 def ablation_table(preset: str = "MAYA_250M") -> List[Dict[str, Any]]:
     """Static description of the matrix; useful for docs and experiment planning."""

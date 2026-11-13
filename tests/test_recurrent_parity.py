@@ -64,7 +64,7 @@ class TestRecurrentParity(unittest.TestCase):
             full_logits, _ = model(ids)
             head_logits, bundle, info = model.prefill(ids[:, :prefix])
 
-            self.assertEqual(bundle["schema_version"], 2)
+            self.assertEqual(bundle["schema_version"], 3)
             self.assertEqual(bundle["num_loops"], loops)
             self.assertEqual(info["effective_len"], prefix)
             self.assertEqual(bundle["position"], prefix)

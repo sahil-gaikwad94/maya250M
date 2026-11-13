@@ -36,6 +36,13 @@ from .packer import (
     fim_example,
 )
 from .repomap import RepoMap, RepoMapBuilder, RepoMapEntry
+from .transaction import (
+    FileEdit,
+    PatchTransaction,
+    count_assertions,
+    is_test_path,
+    tree_hash,
+)
 
 __all__ = [
     "EDIT_FILE_MARKER",
@@ -66,4 +73,9 @@ __all__ = [
     "RepoMap",
     "RepoMapBuilder",
     "RepoMapEntry",
+    "FileEdit",
+    "PatchTransaction",
+    "count_assertions",
+    "is_test_path",
+    "tree_hash",
 ]
