@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+from typing import Dict, Tuple
 
 import torch
 
@@ -60,6 +61,55 @@ def detect_kaggle_accelerator() -> dict:
         "batch_size": 2,
         "grad_accum": 2,
         "dtype": "float32",
+    }
+
+
+def resolve_training_device(hw: Dict[str, object]) -> Tuple[torch.device, Dict[str, object]]:
+    """Map a detected accelerator onto a real device plus a strategy record.
+
+    A TPU session used to fall through to CPU while still logging
+    ``accelerator: tpu``: the run burned weekly quota at CPU speed and its
+    throughput figure was meaningless. A missing torch_xla is therefore a hard
+    error, never a silent fallback.
+    """
+    backend = str(hw.get("backend", "cpu"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
+
+    if backend == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise SystemExit(
+                "detected a TPU session but torch_xla is not importable "
+                f"({exc}); install it or unset PJRT_DEVICE/TPU_NAME — refusing to "
+                "silently train on CPU"
+            )
+        return xm.xla_device(), {
+            "backend": backend,
+            "device": "xla",
+            "parallel": "xla_multi" if world_size > 1 else "xla_single",
+            "world_size": world_size,
+        }
+
+    if backend.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "CUDA backend detected but torch.cuda.is_available() is False; "
+                "refusing to silently train on CPU"
+            )
+        local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+        return torch.device("cuda", local_rank), {
+            "backend": backend,
+            "device": f"cuda:{local_rank}",
+            "parallel": "ddp_not_implemented" if world_size > 1 else "single_gpu",
+            "world_size": world_size,
+        }
+
+    return torch.device("cpu"), {
+        "backend": "cpu",
+        "device": "cpu",
+        "parallel": "single_cpu",
+        "world_size": 1,
     }
 
 
@@ -139,7 +189,13 @@ def main() -> int:
         last_ckpt if os.path.exists(last_ckpt) else None
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, strategy = resolve_training_device(hw)
+    if strategy["parallel"] == "ddp_not_implemented":
+        raise SystemExit(
+            "WORLD_SIZE>1 requested but distributed data-parallel training is "
+            "NOT_RUN in this repository; launch one process single-device, or "
+            "implement and verify DDP before quoting multi-GPU scaling"
+        )
     state = train_maya(
         model,
         train_ds,
@@ -160,6 +216,9 @@ def main() -> int:
 
     chain_status = {
         "accelerator": hw["backend"],
+        "device": strategy["device"],
+        "parallel": strategy["parallel"],
+        "world_size": strategy["world_size"],
         "step": state["step"],
         "epoch": state["epoch"],
         "next_batch_cursor": state["next_batch_cursor"],

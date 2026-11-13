@@ -346,6 +346,18 @@ class TestMemorySubsystem(unittest.TestCase):
         # 250,007,328 + 98,304 = 250,105,632 (< 251,000,000 ceiling)
         self.assertEqual(250_007_328 + proj.n_parameters, 250_105_632)
 
+    def test_projection_state_dict_round_trip(self):
+        original = MemoryProjection(d=64, dim=8, seed=3)
+        restored = MemoryProjection(d=64, dim=8, seed=999)
+        restored.load_state_dict(original.state_dict())
+        np.testing.assert_allclose(restored.weight, original.weight)
+        probe = np.linspace(-1.0, 1.0, 64, dtype=np.float32)
+        np.testing.assert_allclose(
+            restored.project(probe), original.project(probe), rtol=1e-5, atol=1e-6
+        )
+        with self.assertRaises(ValueError):
+            MemoryProjection(d=32, dim=8).load_state_dict(original.state_dict())
+
     def test_working_memory_eviction_keeps_pinned(self):
         wm = WorkingMemoryState(max_facts=2)
         wm.pin("critical invariant")

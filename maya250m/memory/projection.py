@@ -9,7 +9,7 @@ parameters, which is the only trainable auxiliary added by the memory subsystem.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -52,6 +52,25 @@ class MemoryProjection:
     @property
     def n_parameters(self) -> int:
         return memory_projection_parameters(self.d, self.dim)
+
+    def state_dict(self) -> Dict[str, object]:
+        """Serialisable state, so a trained ``W_mem`` is not lost on save."""
+        return {
+            "d": int(self.d),
+            "dim": int(self.dim),
+            "seed": int(self.seed),
+            "weight": self.weight.copy(),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        """Restore weights, rejecting a shape that would silently mis-project."""
+        weight = np.asarray(state["weight"], dtype=np.float32)
+        if weight.shape != (int(self.dim), int(self.d)):
+            raise ValueError(
+                f"checkpoint weight shape {weight.shape} != expected "
+                f"{(int(self.dim), int(self.d))}"
+            )
+        self.weight = weight
 
     def project(self, x: np.ndarray, l2_normalize: bool = True) -> np.ndarray:
         """Project ``[..., d]`` activations onto the L2-normalised memory space."""

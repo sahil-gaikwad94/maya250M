@@ -5,6 +5,8 @@
     "active_inference_parameters": 8556912,
     "mtp_head_parameters": 524544,
     "auxiliary_memory_head_parameters": 32768,
+    "auxiliary_memory_head_attached": false,
+    "auxiliary_memory_head_status": "auxiliary_untrained",
     "trainable_total_with_auxiliary": 9114224,
     "parameter_budget": 251000000,
     "within_budget": true,
@@ -17,9 +19,23 @@
     "attn_head_dim": 32,
     "max_ctx": 512,
     "kv_cache_bytes_bf16": 524288,
+    "kv_cache_bytes_bf16_by_loops": {
+      "1": 524288,
+      "2": 786432,
+      "3": 1048576,
+      "4": 1310720
+    },
     "dense_counterfactual_kv_bytes_bf16": 2097152,
     "kv_reduction_pct": 75.0,
-    "gdn_state_bytes_fp32": 393216
+    "gdn_state_bytes_fp32": 393216,
+    "gdn_conv_state_bytes_fp32": 55296,
+    "recurrent_state_bytes_fp32": 448512,
+    "recurrent_state_bytes_fp32_by_loops": {
+      "1": 448512,
+      "2": 672768,
+      "3": 897024,
+      "4": 1121280
+    }
   },
   "MAYA_50M_PILOT": {
     "preset": "MAYA_50M_PILOT",
@@ -27,6 +43,8 @@
     "active_inference_parameters": 59916128,
     "mtp_head_parameters": 2097664,
     "auxiliary_memory_head_parameters": 65536,
+    "auxiliary_memory_head_attached": false,
+    "auxiliary_memory_head_status": "auxiliary_untrained",
     "trainable_total_with_auxiliary": 62079328,
     "parameter_budget": 251000000,
     "within_budget": true,
@@ -39,9 +57,23 @@
     "attn_head_dim": 64,
     "max_ctx": 4096,
     "kv_cache_bytes_bf16": 16777216,
+    "kv_cache_bytes_bf16_by_loops": {
+      "1": 16777216,
+      "2": 25165824,
+      "3": 33554432,
+      "4": 41943040
+    },
     "dense_counterfactual_kv_bytes_bf16": 67108864,
     "kv_reduction_pct": 75.0,
-    "gdn_state_bytes_fp32": 3145728
+    "gdn_state_bytes_fp32": 3145728,
+    "gdn_conv_state_bytes_fp32": 221184,
+    "recurrent_state_bytes_fp32": 3366912,
+    "recurrent_state_bytes_fp32_by_loops": {
+      "1": 3366912,
+      "2": 5050368,
+      "3": 6733824,
+      "4": 8417280
+    }
   },
   "MAYA_250M": {
     "preset": "MAYA_250M",
@@ -49,6 +81,8 @@
     "active_inference_parameters": 245287968,
     "mtp_head_parameters": 4719360,
     "auxiliary_memory_head_parameters": 98304,
+    "auxiliary_memory_head_attached": false,
+    "auxiliary_memory_head_status": "auxiliary_untrained",
     "trainable_total_with_auxiliary": 250105632,
     "parameter_budget": 251000000,
     "within_budget": true,
@@ -61,9 +95,23 @@
     "attn_head_dim": 64,
     "max_ctx": 32768,
     "kv_cache_bytes_bf16": 268435456,
+    "kv_cache_bytes_bf16_by_loops": {
+      "1": 268435456,
+      "2": 402653184,
+      "3": 536870912,
+      "4": 671088640
+    },
     "dense_counterfactual_kv_bytes_bf16": 1073741824,
     "kv_reduction_pct": 75.0,
-    "gdn_state_bytes_fp32": 9437184
+    "gdn_state_bytes_fp32": 9437184,
+    "gdn_conv_state_bytes_fp32": 663552,
+    "recurrent_state_bytes_fp32": 10100736,
+    "recurrent_state_bytes_fp32_by_loops": {
+      "1": 10100736,
+      "2": 15151104,
+      "3": 20201472,
+      "4": 25251840
+    }
   },
   "MAYA_1B_SCALE": {
     "preset": "MAYA_1B_SCALE",
@@ -71,6 +119,8 @@
     "active_inference_parameters": 969164352,
     "mtp_head_parameters": 18875904,
     "auxiliary_memory_head_parameters": 196608,
+    "auxiliary_memory_head_attached": false,
+    "auxiliary_memory_head_status": "auxiliary_untrained",
     "trainable_total_with_auxiliary": 988236864,
     "parameter_budget": 251000000,
     "within_budget": false,
@@ -83,8 +133,22 @@
     "attn_head_dim": 64,
     "max_ctx": 32768,
     "kv_cache_bytes_bf16": 536870912,
+    "kv_cache_bytes_bf16_by_loops": {
+      "1": 536870912,
+      "2": 805306368,
+      "3": 1073741824,
+      "4": 1342177280
+    },
     "dense_counterfactual_kv_bytes_bf16": 2147483648,
     "kv_reduction_pct": 75.0,
-    "gdn_state_bytes_fp32": 18874368
+    "gdn_state_bytes_fp32": 18874368,
+    "gdn_conv_state_bytes_fp32": 1327104,
+    "recurrent_state_bytes_fp32": 20201472,
+    "recurrent_state_bytes_fp32_by_loops": {
+      "1": 20201472,
+      "2": 30302208,
+      "3": 40402944,
+      "4": 50503680
+    }
   }
 }

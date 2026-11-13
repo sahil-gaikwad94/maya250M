@@ -11,7 +11,7 @@
    - Every 4th layer (`full`) uses [Differential Attention (Ye et al., ICLR 2025)](https://arxiv.org/abs/2410.05258), subtracting two softmax maps ($\text{Softmax}(Q_1 K_1^\top) - \lambda \text{Softmax}(Q_2 K_2^\top)$) with a learnable per-head noise-cancellation scalar $\lambda$ and sigmoid output gating.
    - Alternating global attention layers use ultra-slow RoPE ($\theta = 10^7$) to separate position-free content retrieval from local token ordering.
 3. **Prelude–Recurrent-Core–Coda Latent Reasoning Loop ([Geiping et al., NeurIPS 2025](https://arxiv.org/abs/2502.05171))**:
-   - Partitions the **32 physical layers** into an 8-layer **Prelude**, a 16-layer **Recurrent Core**, and an 8-layer **Coda**. Iterating the 16-layer core $R_{\text{loop}} \in \{1, 2, 3, 4\}$ times in continuous latent space expands Maya-250M to **48–80 effective layers** of reasoning depth with zero extra parameters or KV cache.
+   - Partitions the **32 physical layers** into an 8-layer **Prelude**, a 16-layer **Recurrent Core**, and an 8-layer **Coda**. Iterating the 16-layer core $R_{\text{loop}} \in \{1, 2, 3, 4\}$ times in continuous latent space expands Maya-250M to **48–80 effective layers** of reasoning depth with zero extra parameters. It is *not* zero extra cache: every core pass keeps its own entries for tier-3 rewinds, so core KV and core GDN state grow by one pass per loop (`kv_cache_bytes_bf16_by_loops` and `recurrent_state_bytes_fp32_by_loops` in the ledger; at $R=2$ the 250M KV cache is 402,653,184 B, not 268,435,456 B).
 4. **Vexx 3.5 Six-Tier Neuro-Symbolic Engine (`maya250m/vexx.py`)**:
    - **Tier 0**: CRANE dual-phase (`UNCONSTRAINED_THINK` inside `<think>...</think>`, `EXPERIMENT_DESIGN` inside `<experiment>...</experiment>`, `STRICT_VERIFIED` outside) + SWYB delimiter-closure lookahead ([CRANE, ICML 2025](https://arxiv.org/html/2502.09061v3)).
    - **Tier 1**: Live `ast` symbol-table & f-string-aware Python lexer + parallel MTP-3 speculative draft tree verifier (`verify_mtp_draft_tree`).
@@ -25,14 +25,16 @@
 
 ## Computed Parameter & Cache Ledger (`metrics_maya250m.json`)
 
-| Preset | Total Params | Active Inference Params | Physical / Effective Layers (2x Loop) | 32K KV Cache (BF16) | Dense Counterfactual KV | GDN FP32 State |
+| Preset | Total Params | Active Inference Params | Physical / Effective Layers (2x Loop) | KV Cache at `max_ctx`, 1 Loop (BF16) | Dense Counterfactual KV | Recurrent State (FP32) |
 | :--- | ---: | ---: | :---: | ---: | ---: | ---: |
-| `MAYA_TINY_TEST` | **9,081,456** | 8,556,912 | 8 / 12 | **262,144 B** | 1,048,576 B (-75%) | 196,608 B |
-| `MAYA_50M_PILOT` | **62,013,792** | 59,916,128 | 16 / 24 | **4,194,304 B** | 16,777,216 B (-75%) | 3,145,728 B |
-| `MAYA_250M` | **250,007,328** | **245,287,968** | **32 / 48** | **134,217,728 B (128 MiB)** | 536,870,912 B (-75%) | **9,437,184 B (9 MiB)** |
+| `MAYA_TINY_TEST` | **9,081,456** | 8,556,912 | 8 / 12 | **524,288 B** | 2,097,152 B (-75%) | 448,512 B |
+| `MAYA_50M_PILOT` | **62,013,792** | 59,916,128 | 16 / 24 | **16,777,216 B (16 MiB)** | 67,108,864 B (-75%) | 3,366,912 B |
+| `MAYA_250M` | **250,007,328** | **245,287,968** | **32 / 48** | **268,435,456 B (256 MiB)** | 1,073,741,824 B (1 GiB) (-75%) | **10,100,736 B (9.6 MiB)** |
 
 The `MAYA_250M` ledger is verified analytically **and** against a live `MayaModel` by
-`tools/param_ledger_maya.py`. The auxiliary shared-trunk memory projection
+`tools/param_ledger_maya.py`, and its cache columns are reconciled against
+`maya250m.cache.cache_memory_ledger` (a measured prefill, not a formula) by
+`tests/test_cache_ledger_truth.py`. The auxiliary shared-trunk memory projection
 (`W_mem`: 768 → 128, bias-free) adds **98,304** parameters, giving a trainable total of
 **250,105,632**, inside the **251,000,000** budget. `W_mem` is deliberately kept out of
 `MayaModel.state_dict()` so Schema-9 checkpoints remain backward compatible.
@@ -45,8 +47,8 @@ The `MAYA_250M` ledger is verified analytically **and** against a live `MayaMode
 | `maya250m/understanding.py` | `TaskSpec` parsing, constraint extraction/coverage, optional neural parser head |
 | `maya250m/reasoning/` | Five-phase state machine, adaptive loop depth (R ∈ 1..4), decomposition DAG, self-correction/abstention |
 | `maya250m/memory/` | SQLite+FTS5 typed memory, vector index, hybrid retrieval, reversible consolidation, `W_mem` projection |
-| `maya250m/codebase/` | AST repo index, PPR repo map, topological packer + AST-aligned FIM, cross-file contract checks, verified SEARCH/REPLACE patches |
-| `maya250m/agent/` | Seven bounded tools, loop-guarded CodeAct runtime, tool-output injection firewall, trajectories + process rewards with observation-masked SFT |
+| `maya250m/codebase/` | AST repo index, PPR repo map, hybrid lexical+graph retrieval (RRF, dense `NOT_RUN`), topological packer + AST-aligned FIM, cross-file contract checks, verified SEARCH/REPLACE patches |
+| `maya250m/agent/` | Eight bounded tools, loop-guarded CodeAct runtime, tool-output injection firewall, trajectories + process rewards with observation-masked SFT |
 | `maya250m/training/` | Staged SFT → distillation → DPO → GRPO trainers with real optimizer updates (BUG-02), zero-variance group masking, frozen references |
 | `maya250m/evaluation/` | Five separate measurement identities, executable harness with explicit `NOT_RUN`, A–P ablation matrix |
 | `maya250m/adaptive.py` | Inference bridge: `TaskSpec` → critical-ambiguity abstention → loop count selection → verified bounded revision, emitting a correctly-identified `Measurement` |

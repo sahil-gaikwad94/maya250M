@@ -11,8 +11,10 @@ Executes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -42,6 +44,58 @@ SYNTHETIC_RESEARCH_CORPUS = [
 ]
 
 
+SYNTHETIC_CORPUS_ID = "synthetic-research-corpus-v1"
+
+#: Presets whose loss curves would be read as a result, not a plumbing check.
+FLAGSHIP_PRESETS = frozenset({"MAYA_250M", "MAYA_1B_SCALE"})
+
+
+def resolve_corpus(
+    corpus_path: Optional[str] = None,
+    preset: str = "MAYA_TINY_TEST",
+    allow_synthetic_at_scale: bool = False,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Return ``(documents, provenance)`` for a run, gating the synthetic fixture.
+
+    The 64 prompt/completion strings above exist to exercise the pipeline end to
+    end. Training a flagship preset on them and quoting the loss would be a fake
+    result, so that combination is refused unless the caller explicitly opts in
+    to a plumbing-only run.
+    """
+    if corpus_path:
+        with open(corpus_path, "r", encoding="utf-8") as handle:
+            documents = [line for line in handle.read().splitlines() if line.strip()]
+        if not documents:
+            raise ValueError(f"corpus {corpus_path!r} contains no non-empty lines")
+        digest = hashlib.sha256("\n".join(documents).encode("utf-8")).hexdigest()
+        return documents, {
+            "source": "file",
+            "path": os.path.abspath(corpus_path),
+            "documents": len(documents),
+            "sha256": digest,
+            "synthetic": False,
+        }
+
+    if str(preset) in FLAGSHIP_PRESETS and not allow_synthetic_at_scale:
+        raise ValueError(
+            f"{preset} cannot be trained on the {SYNTHETIC_CORPUS_ID} fixture "
+            f"({len(SYNTHETIC_RESEARCH_CORPUS)} synthetic documents); pass --corpus "
+            f"with a real dataset, or --allow-synthetic-at-scale for a plumbing check "
+            f"that must not be reported as a training result"
+        )
+
+    digest = hashlib.sha256(
+        "\n".join(SYNTHETIC_RESEARCH_CORPUS).encode("utf-8")
+    ).hexdigest()
+    return list(SYNTHETIC_RESEARCH_CORPUS), {
+        "source": "synthetic",
+        "id": SYNTHETIC_CORPUS_ID,
+        "documents": len(SYNTHETIC_RESEARCH_CORPUS),
+        "sha256": digest,
+        "synthetic": True,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Maya-250M + Vexx 3.5 End-to-End Runner")
     parser.add_argument("--preset", type=str, default="MAYA_TINY_TEST")
@@ -55,6 +109,17 @@ def main() -> int:
     parser.add_argument("--max-wall-hours", type=float, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
+        "--corpus",
+        type=str,
+        default=None,
+        help="newline-delimited documents; defaults to the synthetic fixture",
+    )
+    parser.add_argument(
+        "--allow-synthetic-at-scale",
+        action="store_true",
+        help="let a flagship preset run on the synthetic fixture (plumbing only)",
+    )
+    parser.add_argument(
         "--adaptive-depth",
         action="store_true",
         help="choose recurrent-core loop count per prompt (AdaptiveLoopController)",
@@ -62,9 +127,20 @@ def main() -> int:
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    try:
+        corpus_texts, provenance = resolve_corpus(
+            args.corpus, args.preset, args.allow_synthetic_at_scale
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"data gate: {exc}")
     train_texts, val_texts, test_texts, manifest = deduplicate_and_split(
-        SYNTHETIC_RESEARCH_CORPUS, train_frac=0.75, val_frac=0.125, seed=42
+        corpus_texts, train_frac=0.75, val_frac=0.125, seed=42
     )
+    if not train_texts or not val_texts:
+        raise SystemExit(
+            "data gate: corpus too small after deduplication/validation split "
+            f"(train={len(train_texts)}, val={len(val_texts)}); refusing to train"
+        )
     tok = BPETokenizer.train(train_texts, vocab_size=384, min_pair_freq=2)
     tok.validate()
 
@@ -151,6 +227,7 @@ def main() -> int:
         "generation_loops": gen.num_loops,
         "adaptive_depth": bool(args.adaptive_depth),
         "depth_explain": depth_explain,
+        "data_provenance": provenance,
         "manifest": manifest,
     }
     print(json.dumps(summary, indent=2))

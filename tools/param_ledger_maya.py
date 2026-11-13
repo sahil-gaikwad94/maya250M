@@ -113,7 +113,35 @@ def compute_preset_ledger(name: str) -> dict:
     kv_bytes_per_full_layer = 2 * int(cfg["n_kv_heads"]) * head_dim_attn * max_ctx * 2
     hybrid_kv_bytes = n_full * kv_bytes_per_full_layer
     dense_counterfactual_kv_bytes = int(cfg["layers"]) * kv_bytes_per_full_layer
-    gdn_state_bytes = n_gdn * int(cfg["gdn_heads"]) * (head_dim_gdn ** 2) * 4
+
+    # GDN recurrent state is the FP32 matrix state *plus* the short-conv buffer
+    # (3 * d channels of conv_kernel - 1 history), which the matrix-only count
+    # silently omitted. Verified against maya250m.cache.cache_memory_ledger.
+    gdn_matrix_bytes_per_layer = int(cfg["gdn_heads"]) * (head_dim_gdn ** 2) * 4
+    gdn_conv_bytes_per_layer = 3 * int(cfg["d"]) * (int(cfg["conv_kernel"]) - 1) * 4
+    gdn_state_bytes = n_gdn * gdn_matrix_bytes_per_layer
+    gdn_conv_state_bytes = n_gdn * gdn_conv_bytes_per_layer
+    recurrent_state_bytes = gdn_state_bytes + gdn_conv_state_bytes
+
+    # Each recurrent loop pass keeps its own core-layer cache entries (needed for
+    # tier-3 rewinds), so core KV and core GDN state scale with the loop count.
+    prelude = int(cfg["prelude_layers"])
+    core = int(cfg["core_layers"])
+    core_schedule = schedule[prelude : prelude + core]
+    core_full_layers = sum(1 for s in core_schedule if s == "full")
+    core_gdn_layers = sum(1 for s in core_schedule if s == "gdn")
+    core_kv_per_loop = core_full_layers * kv_bytes_per_full_layer
+    core_state_per_loop = core_gdn_layers * (
+        gdn_matrix_bytes_per_layer + gdn_conv_bytes_per_layer
+    )
+    kv_by_loops = {
+        str(loops): hybrid_kv_bytes + (loops - 1) * core_kv_per_loop
+        for loops in (1, 2, 3, 4)
+    }
+    recurrent_by_loops = {
+        str(loops): recurrent_state_bytes + (loops - 1) * core_state_per_loop
+        for loops in (1, 2, 3, 4)
+    }
 
     eff_2x = int(cfg["prelude_layers"]) + 2 * int(cfg["core_layers"]) + int(cfg["coda_layers"])
     eff_4x = int(cfg["prelude_layers"]) + 4 * int(cfg["core_layers"]) + int(cfg["coda_layers"])
@@ -134,6 +162,10 @@ def compute_preset_ledger(name: str) -> dict:
         "active_inference_parameters": active_inference_params,
         "mtp_head_parameters": mtp_params,
         "auxiliary_memory_head_parameters": w_mem_params,
+        # Honest status: W_mem lives outside MayaModel.state_dict() and no optimizer
+        # in this repo updates it yet, so it is budgeted but NOT trained.
+        "auxiliary_memory_head_attached": False,
+        "auxiliary_memory_head_status": "auxiliary_untrained",
         "trainable_total_with_auxiliary": trainable_total,
         "parameter_budget": PARAMETER_BUDGET,
         "within_budget": trainable_total <= PARAMETER_BUDGET,
@@ -146,11 +178,15 @@ def compute_preset_ledger(name: str) -> dict:
         "attn_head_dim": head_dim_attn,
         "max_ctx": max_ctx,
         "kv_cache_bytes_bf16": hybrid_kv_bytes,
+        "kv_cache_bytes_bf16_by_loops": kv_by_loops,
         "dense_counterfactual_kv_bytes_bf16": dense_counterfactual_kv_bytes,
         "kv_reduction_pct": round(
             100.0 * (1.0 - hybrid_kv_bytes / max(1, dense_counterfactual_kv_bytes)), 2
         ),
         "gdn_state_bytes_fp32": gdn_state_bytes,
+        "gdn_conv_state_bytes_fp32": gdn_conv_state_bytes,
+        "recurrent_state_bytes_fp32": recurrent_state_bytes,
+        "recurrent_state_bytes_fp32_by_loops": recurrent_by_loops,
     }
 
 
