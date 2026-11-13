@@ -73,4 +73,27 @@ python3 kaggle/pack_shards_cpu.py --output-prefix /tmp/maya_shard --seq-len 128
 
 # 5. Launch the Kaggle auto-chaining trainer (auto-detects TPU v3-8/v5e-8 or Dual T4 x2)
 python3 kaggle/train_maya250m_kaggle.py --preset MAYA_TINY_TEST --max-steps 20 --ckpt-dir /tmp/maya_ckpt
+
+# 6. Score the five domains (coding / maths / reasoning / research / neural) on a checkpoint
+python3 tools/eval_maya_domains.py --preset MAYA_TINY_TEST --steps 300
 ```
+
+## Domain Evaluation (measured, not claimed)
+
+Every task is scored by *running* something — unit tests inside the Vexx sandbox, exact
+rational arithmetic, or an AST check — never by string similarity to a reference answer.
+`model_only` is the network's own continuation; `system_symbolic` adds Vexx's exact
+derivation for prompts that state an expression, and the two columns are never merged
+into one number. Each domain also reports `completion_diversity`, which catches a model
+that emits one memorized template regardless of the prompt.
+
+Measured on `MAYA_TINY_TEST` (9M parameters, 300 CPU steps, the 64-document synthetic
+fixture): held-out CE **4.19**, perplexity **66.2**; `pass@1 = 0.000` on coding, maths,
+reasoning, research *and* neural; `system_symbolic = 1.000` on maths and research. Every
+domain reported `unique completions 1/n` with `collapse_detected: true` in
+`artifacts/eval_domains.json`: the model emits `def sum_to_<k>(...)` for every prompt.
+
+That is the honest state of a 9M model trained for 300 steps on fixture data — the
+verifiers, the exact-arithmetic path and the collapse detector work; the intelligence
+does not exist yet. Run the same command with `--corpus` and a real preset to measure
+something meaningful.

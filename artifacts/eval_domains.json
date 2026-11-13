@@ -1,0 +1,678 @@
+{
+  "claim_scope": "model_only scores come from the neural model's own continuation; system_symbolic adds exact arithmetic derived from the prompt expression. The two are never merged into one number.",
+  "data_provenance": {
+    "documents": 64,
+    "id": "synthetic-research-corpus-v1",
+    "sha256": "2123aa74e30ac2442500b0e4635fe11409a70da1f823178bbf7d7a4f574a25c4",
+    "source": "synthetic",
+    "synthetic": true
+  },
+  "domains": {
+    "coding": {
+      "diagnostics": {
+        "completion_diversity": {
+          "collapse_detected": true,
+          "samples": 6,
+          "unique": 1,
+          "unique_ratio": 0.16666666666666666
+        }
+      },
+      "model_only": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_add",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_square",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_max_of_three",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_count_vowels",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_factorial",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "coding_reverse_words",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 0.0,
+              "solved_tasks": 0,
+              "tasks": 6
+            },
+            "n": 6,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "coding/model_only"
+      }
+    },
+    "maths": {
+      "diagnostics": {
+        "completion_diversity": {
+          "collapse_detected": true,
+          "samples": 6,
+          "unique": 1,
+          "unique_ratio": 0.16666666666666666
+        }
+      },
+      "model_only": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_mul_add",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_power",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_gauss",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_fraction_add",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_sub_mul",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "maths_fraction_mul",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 0.0,
+              "solved_tasks": 0,
+              "tasks": 6
+            },
+            "n": 6,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "maths/model_only"
+      },
+      "symbolic": {
+        "attempts": 6,
+        "derivations": 6,
+        "failures": 0
+      },
+      "system_symbolic": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_mul_add",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_power",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_gauss",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_fraction_add",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_sub_mul",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "maths_fraction_mul",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 1.0,
+              "solved_tasks": 6,
+              "tasks": 6
+            },
+            "n": 6,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "maths/system_symbolic"
+      }
+    },
+    "neural": {
+      "diagnostics": {
+        "completion_diversity": {
+          "collapse_detected": true,
+          "samples": 6,
+          "unique": 1,
+          "unique_ratio": 0.16666666666666666
+        }
+      },
+      "model_only": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_2",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_3",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_4",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_5",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "neural_syntax_6",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 0.0,
+              "solved_tasks": 0,
+              "tasks": 6
+            },
+            "n": 6,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "neural/model_only"
+      }
+    },
+    "reasoning": {
+      "diagnostics": {
+        "completion_diversity": {
+          "collapse_detected": true,
+          "samples": 4,
+          "unique": 1,
+          "unique_ratio": 0.25
+        }
+      },
+      "model_only": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "reasoning_safe_div",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "reasoning_clamp",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "reasoning_second_largest",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "reasoning_is_even",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 0.0,
+              "solved_tasks": 0,
+              "tasks": 4
+            },
+            "n": 4,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "reasoning/model_only"
+      }
+    },
+    "research": {
+      "diagnostics": {
+        "completion_diversity": {
+          "collapse_detected": true,
+          "samples": 4,
+          "unique": 1,
+          "unique_ratio": 0.25
+        }
+      },
+      "model_only": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "research_compound",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "research_even_sum",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "research_choose",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 0.0,
+              "passed_samples": 0
+            },
+            "n": 1,
+            "name": "research_mean",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 0.0,
+              "solved_tasks": 0,
+              "tasks": 4
+            },
+            "n": 4,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 0.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "research/model_only"
+      },
+      "symbolic": {
+        "attempts": 4,
+        "derivations": 4,
+        "failures": 0
+      },
+      "system_symbolic": {
+        "identity": "benchmark",
+        "measurements": [
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "research_compound",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "research_even_sum",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "research_choose",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "pass_at_k": 1.0,
+              "passed_samples": 1
+            },
+            "n": 1,
+            "name": "research_mean",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          },
+          {
+            "identity": "benchmark",
+            "metadata": {
+              "aggregation": "mean_of_per_task_pass_at_k",
+              "micro_pass_rate": 1.0,
+              "solved_tasks": 4,
+              "tasks": 4
+            },
+            "n": 4,
+            "name": "pass@1",
+            "status": "MEASURED",
+            "unit": "pass_rate",
+            "value": 1.0
+          }
+        ],
+        "status": "MEASURED",
+        "title": "research/system_symbolic"
+      }
+    }
+  },
+  "held_out": {
+    "val_intermediate_loss": 0.0,
+    "val_loss": 4.192245487922509,
+    "val_mtp_loss": 4.229883418527389,
+    "val_ppl": 66.17121091536625,
+    "val_tokens": 527,
+    "val_total_objective": 5.038222171627988
+  },
+  "manifest": {
+    "corpus_sha256": "abde42566e8bb2864685446c3b2071b10a23b2a91d12a687e81e7a658d96b400",
+    "dedup": "sha256(strip(text))",
+    "dropped_duplicates": 0,
+    "n_test": 8,
+    "n_train": 48,
+    "n_val": 8,
+    "raw_count": 64,
+    "seed": 7,
+    "train_frac": 0.75,
+    "unique_count": 64,
+    "val_frac": 0.125
+  },
+  "parameters": 7075696,
+  "preset": "MAYA_TINY_TEST",
+  "training": {
+    "loaded_from": "/tmp/maya_eval_ckpt/maya_eval_last.pt",
+    "steps": 0
+  }
+}

@@ -96,8 +96,14 @@ def run_tasks(
     title: str = "benchmark",
     k: int = 1,
     reason: str = "no generator supplied; benchmark not executed in this environment",
+    on_sample: Optional[Callable[[EvalTask, str], None]] = None,
 ) -> EvalReport:
-    """Evaluate ``tasks`` or return an explicit NOT_RUN report."""
+    """Evaluate ``tasks`` or return an explicit NOT_RUN report.
+
+    ``on_sample`` receives every generated sample so a caller can compute
+    diagnostics (for example whether the model produced one repeated template)
+    without the harness itself judging them.
+    """
     if not tasks:
         raise ValueError("no evaluation tasks supplied")
 
@@ -128,6 +134,8 @@ def run_tasks(
                     {"passed": False, "failure_category": "generation_error", "message": str(exc)}
                 )
                 continue
+            if on_sample is not None:
+                on_sample(task, sample)
             result = task.verifier(sample)
             passed += int(result.passed)
             verifications.append(result.to_dict())

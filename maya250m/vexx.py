@@ -214,6 +214,23 @@ class Vexx35Controller:
         "getattr", "setattr", "delattr", "vars", "input", "breakpoint",
     }
 
+    #: String methods that are safe to call on a *literal*. ``" ".join(parts)`` is
+    #: ordinary Python, and rejecting it failed correct solutions for style rather
+    #: than for safety. ``format``/``format_map`` stay out: a format string can walk
+    #: attribute paths into a rendering of the object graph.
+    SAFE_LITERAL_ATTRIBUTES = frozenset(
+        {
+            "capitalize", "casefold", "center", "count", "endswith",
+            "expandtabs", "find", "index", "isalnum", "isalpha", "isascii",
+            "isdecimal", "isdigit", "isidentifier", "islower", "isnumeric",
+            "isprintable", "isspace", "istitle", "isupper", "join", "ljust",
+            "lower", "lstrip", "partition", "removeprefix", "removesuffix",
+            "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit",
+            "rstrip", "split", "splitlines", "startswith", "strip",
+            "swapcase", "title", "upper", "zfill",
+        }
+    )
+
     def __init__(
         self,
         domain_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -957,7 +974,13 @@ class Vexx35Controller:
             if isinstance(node, ast.Attribute) and not isinstance(
                 node.value, (ast.Name, ast.Attribute, ast.Call)
             ):
-                raise PermissionError("Forbidden attribute access on a literal")
+                literal_method = (
+                    isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                    and node.attr in cls.SAFE_LITERAL_ATTRIBUTES
+                )
+                if not literal_method:
+                    raise PermissionError("Forbidden attribute access on a literal")
 
     @classmethod
     def _sandbox_dispatch(

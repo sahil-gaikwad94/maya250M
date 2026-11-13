@@ -115,4 +115,30 @@ __all__ = [
     "register_score",
     "run_from_manifest",
     "validate_manifest",
+    "DOMAINS",
+    "SymbolicSolver",
+    "all_tasks",
+    "completion_syntax_verifier",
+    "completion_diversity",
+    "domain_tasks",
+    "exact_answer_verifier",
+    "expressions_by_prompt",
+    "extract_stated_answer",
+    "forbidden_tokens_verifier",
+    "marker_self_consistency_verifier",
+    "symbolic_repair_generate",
 ]
+
+from .domains import (
+    DOMAINS,
+    all_tasks,
+    completion_diversity,
+    completion_syntax_verifier,
+    domain_tasks,
+    exact_answer_verifier,
+    expressions_by_prompt,
+    extract_stated_answer,
+    forbidden_tokens_verifier,
+    marker_self_consistency_verifier,
+)
+from .symbolic import SymbolicSolver, symbolic_repair_generate
