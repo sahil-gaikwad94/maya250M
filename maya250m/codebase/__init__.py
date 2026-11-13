@@ -36,6 +36,18 @@ from .packer import (
     fim_example,
 )
 from .repomap import RepoMap, RepoMapBuilder, RepoMapEntry
+from .retrieval import (
+    RRF_K,
+    DenseRanker,
+    HybridRetriever,
+    RetrievalCandidate,
+    RetrievalContext,
+    RetrievalResult,
+    bm25_scores,
+    reciprocal_rank_fusion,
+    tokenize,
+    tokenize_identifier,
+)
 from .transaction import (
     FileEdit,
     PatchTransaction,
@@ -73,6 +85,16 @@ __all__ = [
     "RepoMap",
     "RepoMapBuilder",
     "RepoMapEntry",
+    "RRF_K",
+    "DenseRanker",
+    "HybridRetriever",
+    "RetrievalCandidate",
+    "RetrievalContext",
+    "RetrievalResult",
+    "bm25_scores",
+    "reciprocal_rank_fusion",
+    "tokenize",
+    "tokenize_identifier",
     "FileEdit",
     "PatchTransaction",
     "count_assertions",

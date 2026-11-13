@@ -48,6 +48,7 @@ class RepoTokens:
     order: List[str] = field(default_factory=list)
     tokens_used: int = 0
     truncated: bool = False
+    skipped: List[str] = field(default_factory=list)
 
 
 #: Backwards-compatible alias used by the specification's target layout.
@@ -103,13 +104,21 @@ class TopologicalRepoPacker:
         tokenizer=None,
         max_file_chars: Optional[int] = None,
     ) -> RepoTokens:
-        """Render the ordered stream with explicit ``# <|file_sep|> path`` headers."""
+        """Render the ordered stream with explicit ``# <|file_sep|> path`` headers.
+
+        A file that does not fit is *skipped*, never used to abort the walk: letting
+        one enormous file end packing would starve every smaller foundation behind
+        it, which is exactly the wrong trade for a callee-before-caller stream. After
+        the whole-file pass, leftover budget is filled with trimmed bodies of the
+        skipped files, so the window is still used and the tail is visibly marked.
+        """
         order = list(order) if order is not None else self.topological_order()
         contents = contents or {}
         chunks: List[str] = []
         used_paths: List[str] = []
         used_tokens = 0
         truncated = False
+        oversized: List[Tuple[str, str]] = []
 
         def count(text: str) -> int:
             if tokenizer is not None:
@@ -120,32 +129,104 @@ class TopologicalRepoPacker:
             return max(1, (len(text) + 3) // 4)
 
         for path in order:
-            if path in contents:
-                body = contents[path]
-            else:
-                full = os.path.join(self.indexer.root, path)
-                try:
-                    with open(full, "r", encoding="utf-8") as handle:
-                        body = handle.read()
-                except OSError:
-                    continue
+            body = self._read_body(path, contents)
+            if body is None:
+                continue
             if max_file_chars is not None and len(body) > int(max_file_chars):
                 body = body[: int(max_file_chars)].rstrip() + "\n# ... [truncated]\n"
-            block = f"{self.file_sep}{path}\n{body.rstrip()}\n"
+                truncated = True
+            block = self._render_block(path, body)
             cost = count(block)
             if token_budget is not None and used_tokens + cost > int(token_budget):
                 truncated = True
-                break
+                oversized.append((path, body))
+                continue
             chunks.append(block)
             used_paths.append(path)
             used_tokens += cost
 
+        if oversized and token_budget is not None:
+            for path, body in oversized:
+                room = int(token_budget) - used_tokens
+                if room <= 0:
+                    break
+                fitted = self._trim_block(path, body, room, count)
+                if fitted is None:
+                    continue
+                block, cost = fitted
+                chunks.append(block)
+                used_paths.append(path)
+                used_tokens += cost
+
+        packed = set(used_paths)
+        skipped = [path for path, _body in oversized if path not in packed]
         return RepoTokens(
             text="\n".join(chunks).strip() + "\n",
             order=used_paths,
             tokens_used=used_tokens,
             truncated=truncated,
+            skipped=skipped,
         )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _read_body(self, path: str, contents: Dict[str, str]) -> Optional[str]:
+        """Source for ``path``: supplied content first, then the repository."""
+        if path in contents:
+            return contents[path]
+        full = os.path.join(self.indexer.root, path)
+        try:
+            with open(full, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _render_block(self, path: str, body: str) -> str:
+        return f"{self.file_sep}{path}\n{body.rstrip()}\n"
+
+    def _trim_block(
+        self,
+        path: str,
+        body: str,
+        room: int,
+        count,
+        min_body_chars: int = 80,
+    ) -> Optional[Tuple[str, int]]:
+        """Largest line-aligned prefix of ``body`` that fits in ``room`` tokens.
+
+        Returns ``None`` when not even a useful stub fits, so a header is never
+        emitted claiming a file whose content was entirely dropped.
+        """
+        header = f"{self.file_sep}{path}\n"
+        marker = "\n# ... [truncated]\n"
+        if count(header + marker) > room:
+            return None
+
+        best_keep = 0
+        low, high = 0, len(body)
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = header + body[:mid].rstrip() + marker
+            if count(candidate) <= room:
+                best_keep = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best_keep <= 0:
+            return None
+
+        # Back off to the last complete line so a token is not cut mid-identifier.
+        boundary = body.rfind("\n", 0, best_keep)
+        if boundary > 0:
+            best_keep = boundary
+        kept = body[:best_keep].rstrip()
+        if len(kept) < int(min_body_chars):
+            return None
+        block = header + kept + marker
+        cost = count(block)
+        if cost > room:  # pragma: no cover - binary search already guaranteed this
+            return None
+        return block, cost
 
 
 @dataclass
