@@ -53,6 +53,21 @@ from .repo_ordering_ablation import (
     run_ordering_ablation,
     AblationReport,
 )
+from .experiment import (
+    ExperimentManifest,
+    ExperimentRun,
+    SCORECARD_MODES,
+    Score,
+    ScoreMode,
+    Scorecard,
+    experiment_commit_info,
+    hash_file,
+    load_scores_from_jsonl,
+    publish_allowed,
+    register_score,
+    run_from_manifest,
+    validate_manifest,
+)
 
 __all__ = [
     "ABLATIONS",
@@ -87,4 +102,17 @@ __all__ = [
     "ngram_set",
     "protect_heldout",
     "scan_contamination",
+    "ExperimentManifest",
+    "ExperimentRun",
+    "SCORECARD_MODES",
+    "Score",
+    "ScoreMode",
+    "Scorecard",
+    "experiment_commit_info",
+    "hash_file",
+    "load_scores_from_jsonl",
+    "publish_allowed",
+    "register_score",
+    "run_from_manifest",
+    "validate_manifest",
 ]
