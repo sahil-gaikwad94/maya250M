@@ -1,3 +1,4 @@
+```python
 """Phase 0B regression suite for BUG-05, BUG-08, BUG-09 and BUG-10.
 
 * BUG-05: WY chunkwise scan must preserve a non-zero initial GDN state on the very
@@ -87,9 +88,9 @@ class TestPhase0BRegressions(unittest.TestCase):
 
     def test_bug08_contractor_rewinds_v2_structured_cache(self):
         torch = _torch()
-        if torch is None:
-            self.skipTest("PyTorch not installed")
-        from maya250m.model import create_empty_hybrid_cache_v2
+        from maya250m import create_empty_hybrid_cache_v2
+        ones = (lambda *s: torch.ones(*s)) if torch is not None else (lambda *s: np.ones(s, dtype=np.float32))
+        zeros = (lambda *s: torch.zeros(*s)) if torch is not None else (lambda *s: np.zeros(s, dtype=np.float32))
 
         vexx = Vexx35Controller()
         bundle = create_empty_hybrid_cache_v2(
@@ -102,16 +103,16 @@ class TestPhase0BRegressions(unittest.TestCase):
         )
         bundle["position"] = 10
         bundle["prelude"][0] = {
-            "k": torch.ones(1, 4, 10, 8),
-            "v": torch.ones(1, 4, 10, 8),
+            "k": ones(1, 4, 10, 8),
+            "v": ones(1, 4, 10, 8),
         }
         bundle["core_loops"][1][0] = {
-            "k": torch.ones(1, 4, 10, 8),
-            "v": torch.ones(1, 4, 10, 8),
+            "k": ones(1, 4, 10, 8),
+            "v": ones(1, 4, 10, 8),
         }
         bundle["coda"][0] = {
-            "state": torch.ones(1, 4, 8, 8),
-            "conv": torch.zeros(1, 3, 24),
+            "state": ones(1, 4, 8, 8),
+            "conv": zeros(1, 3, 24),
         }
 
         vexx.save_checkpoint(
@@ -162,11 +163,16 @@ class TestPhase0BRegressions(unittest.TestCase):
 
     def test_bug10_cas_splice_respects_generation_budget(self):
         torch = _torch()
-        if torch is None:
-            self.skipTest("PyTorch not installed")
-
         tok = BPETokenizer()
         eq_id = tok.token_to_id["="]
+
+        def _make_logits(b):
+            if torch is not None:
+                logits = torch.full((b, tok.vocab_size), -1e4)
+            else:
+                logits = np.full((b, tok.vocab_size), -1e4, dtype=np.float32)
+            logits[:, eq_id] = 0.0
+            return logits
 
         class _StubModel:
             max_ctx = 64
@@ -176,8 +182,7 @@ class TestPhase0BRegressions(unittest.TestCase):
 
             def prefill(self, input_ids, doc_ids=None, num_loops=None, tokenizer_hash=None):
                 b, n = input_ids.shape
-                logits = torch.full((b, tok.vocab_size), -1e4)
-                logits[:, eq_id] = 0.0
+                logits = _make_logits(b)
                 bundle = {
                     "schema_version": 2,
                     "num_loops": 1,
@@ -198,11 +203,10 @@ class TestPhase0BRegressions(unittest.TestCase):
 
             def decode_step(self, token_id, cache_bundle, seq_start=None, return_hidden=False):
                 n = int(token_id.shape[1])
-                logits = torch.full((1, tok.vocab_size), -1e4)
-                logits[:, eq_id] = 0.0
+                logits = _make_logits(1)
                 bundle = dict(cache_bundle)
                 bundle["position"] = int(bundle["position"]) + n
-                return logits[:, -1, :], bundle
+                return logits, bundle
 
         class _SplicingVexx:
             def apply_in_flight_mask(
@@ -232,6 +236,53 @@ class TestPhase0BRegressions(unittest.TestCase):
         )
         self.assertLessEqual(result.tokens_generated, 1)
         self.assertEqual(result.tokens_generated, 1)
+
+
+    def test_bug11_subscript_method_call_allowed_by_ast_policy(self):
+        """BUG-11: adj[u].append(v) and dp[i].append(x) must not be rejected as literal attribute access."""
+        vexx = Vexx35Controller()
+        dag_code = (
+            "def topo_sort(n, edges):\n"
+            "    indeg = [0] * n\n"
+            "    adj = {i: [] for i in range(n)}\n"
+            "    for u, v in edges:\n"
+            "        adj[u].append(v)\n"
+            "        indeg[v] += 1\n"
+            "    q = [i for i in range(n) if indeg[i] == 0]\n"
+            "    order = []\n"
+            "    for u in q:\n"
+            "        order.append(u)\n"
+            "        for v in adj[u]:\n"
+            "            indeg[v] -= 1\n"
+            "            if indeg[v] == 0:\n"
+            "                q.append(v)\n"
+            "    return order if len(order) == n else []\n"
+        )
+        passed, total, errors = vexx.safe_execute_python(
+            dag_code,
+            "topo_sort",
+            [
+                {"input": [4, [(0, 1), (0, 2), (1, 3), (2, 3)]], "expected": [0, 1, 2, 3]},
+                {"input": [2, [(0, 1), (1, 0)]], "expected": []},
+            ],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual((passed, total), (2, 2))
+
+    def test_bug12_tuple_inputs_not_falsely_flagged_as_mutated(self):
+        """BUG-12: tuple elements inside test inputs must not trigger false input-mutation errors after JSON IPC."""
+        vexx = Vexx35Controller()
+        code = (
+            "def sum_pairs(nums, pairs):\n"
+            "    return [nums[l] + nums[r] for l, r in pairs]\n"
+        )
+        passed, total, errors = vexx.safe_execute_python(
+            code,
+            "sum_pairs",
+            [{"input": [[10, 20, 30, 40], [(0, 2), (1, 3)]], "expected": [40, 60]}],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual((passed, total), (1, 1))
 
 
 if __name__ == "__main__":
