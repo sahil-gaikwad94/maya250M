@@ -16,10 +16,16 @@ import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import torch
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
 
-from maya250m import MayaModel, get_config
-from maya250m.cache import cache_memory_ledger
+from maya250m import get_config
+
+if torch is not None:
+    from maya250m import MayaModel
+    from maya250m.cache import cache_memory_ledger
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -95,6 +101,7 @@ class TestLedgerArithmetic(unittest.TestCase):
             self.assertEqual(row["kv_cache_bytes_bf16_by_loops"]["1"], row["kv_cache_bytes_bf16"])
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestMeasuredCache(unittest.TestCase):
     """A measured prefill must reproduce the ledger, loop by loop."""
 
@@ -148,6 +155,16 @@ class TestReadmeTable(unittest.TestCase):
     def test_readme_does_not_repeat_the_zero_kv_loop_claim(self):
         self.assertNotIn("zero extra parameters or KV cache", README)
         self.assertIn("kv_cache_bytes_bf16_by_loops", README)
+
+    def test_model_docstring_matches_the_loop_cache_ledger(self):
+        """P0.10: the module docstring may not claim a zero-KV recurrent loop."""
+        with open(
+            os.path.join(PROJECT_ROOT, "maya250m", "model.py"), encoding="utf-8"
+        ) as handle:
+            source = handle.read()
+        self.assertNotIn("without increasing parameter count or KV cache", source)
+        self.assertIn("+128 MiB", source)
+        self.assertIn("402,653,184", source)
 
 
 if __name__ == "__main__":

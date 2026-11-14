@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from maya250m.agent import (
     AgentRuntime,
     AgentTrajectory,
+    CompletionEvidence,
     RepoTools,
     ToolOutputFirewall,
     build_sft_example,
@@ -194,6 +195,10 @@ class TestRuntime(AgentFixture):
 
     def test_full_episode_reward_and_sft_masking(self):
         runtime = self._runtime()
+        requirement_id = runtime.register_requirement(
+            "add() returns a + b and the suite passes", test_ids=["tests/"]
+        )
+        self.assertEqual(requirement_id, "constraint_0")
         runtime.localize("add returns the wrong value")
         runtime.inspect("add")
         before = runtime.run_tests("tests/", timeout_s=60)
@@ -204,11 +209,28 @@ class TestRuntime(AgentFixture):
         )
         self.assertTrue(patched.passed, patched.to_dict())
 
-        after = runtime.run_tests("tests/", timeout_s=60)
+        after = runtime.run_tests(
+            "tests/", timeout_s=60, requirement_ids=[requirement_id]
+        )
         self.assertTrue(after.passed, after.to_dict())
+        self.assertEqual(runtime.requirement_evidence[requirement_id].status, "verified")
 
-        trajectory = runtime.finish(True, note="fixed add()")
+        evidence = CompletionEvidence(
+            patch_applied=True,
+            targeted_tests_passed=True,
+            regression_tests_passed=True,
+            static_checks_passed=True,
+            required_constraints_verified=[requirement_id],
+            unresolved_constraints=[],
+            final_diff_sha256=runtime.diff_sha256(runtime.last_patch_text),
+            test_run_ids=[runtime._test_runs[-1]["id"]],
+        )
+        trajectory = runtime.finalize(evidence, note="fixed add()")
         self.assertTrue(trajectory.resolved)
+        completion = trajectory.metadata["completion_evidence"]
+        self.assertTrue(completion["verified"])
+        self.assertEqual(completion["problems"], [])
+        self.assertIn(requirement_id, completion["required_constraints_verified"])
 
         reward = runtime.reward()
         self.assertEqual(reward.outcome, 1.0)
@@ -232,8 +254,88 @@ class TestRuntime(AgentFixture):
 
         runtime.tools.git_revert_file("pkg/mathx.py")
 
+    def test_boolean_finish_cannot_resolve_a_trajectory(self):
+        runtime = self._runtime()
+        runtime.localize("add")
+        trajectory = runtime.finish(True, note="claimed success")
+        self.assertFalse(trajectory.resolved)
+        self.assertEqual(trajectory.outcome, 0)
+        self.assertFalse(
+            trajectory.metadata["completion_evidence"]["verified"]
+        )
+
+    def test_one_passing_test_does_not_verify_an_unrelated_requirement(self):
+        runtime = self._runtime()
+        covered = runtime.register_requirement(
+            "add() returns a + b", test_ids=["tests/test_add.py"]
+        )
+        unrelated = runtime.register_requirement(
+            "the CLI grows a --strict flag", test_ids=["tests/test_cli.py"]
+        )
+        runtime.localize("add returns the wrong value")
+        runtime.inspect("add")
+        runtime.patch(
+            "pkg/mathx.py", "    return a - b  # BUG: should be +", "    return a + b"
+        )
+        passed = runtime.run_tests(
+            "tests/test_add.py", timeout_s=60, requirement_ids=[covered]
+        )
+        self.assertTrue(passed.passed)
+        self.assertEqual(runtime.requirement_evidence[covered].status, "verified")
+        self.assertEqual(
+            runtime.requirement_evidence[unrelated].status, "unknown"
+        )
+
+    def test_typed_verifiers_are_evidence_gated(self):
+        runtime = self._runtime()
+        requirement_id = runtime.register_requirement(
+            "the module path a.py exists", verifier_ids=["path_presence"]
+        )
+        failed = runtime.check_requirements(
+            {"expected_paths": ["a.py"], "present_paths": ["b.py"]}
+        )
+        self.assertEqual(failed[requirement_id]["status"], "failed")
+        self.assertEqual(runtime.requirement_evidence[requirement_id].status, "failed")
+
+        verified = runtime.check_requirements(
+            {"expected_paths": ["a.py"], "present_paths": ["a.py"]}
+        )
+        self.assertEqual(verified[requirement_id]["status"], "verified")
+        self.assertTrue(runtime.requirement_evidence[requirement_id].evidence_ids)
+
+    def test_waived_requirement_does_not_block_completion(self):
+        runtime = self._runtime()
+        waived_id = runtime.register_requirement("the CLI grows a --strict flag")
+        runtime._test_runs = [
+            {
+                "id": "test_run_1",
+                "target": "tests/",
+                "passed": True,
+                "step": 1,
+                "edit_generation": 0,
+                "requirement_ids": [],
+                "failure_category": None,
+            }
+        ]
+        evidence = CompletionEvidence(
+            patch_applied=False,
+            targeted_tests_passed=True,
+            regression_tests_passed=True,
+            static_checks_passed=None,
+            required_constraints_verified=[],
+            unresolved_constraints=[],
+            final_diff_sha256=None,
+            test_run_ids=["test_run_1"],
+            waived_constraints=[waived_id],
+        )
+        self.assertEqual(runtime._completion_problems(evidence), [])
+        evidence.waived_constraints = []
+        self.assertTrue(runtime._completion_problems(evidence))
+
     def test_redundancy_penalty(self):
-        trajectory = AgentTrajectory(task_id="toy", outcome=1)
+        trajectory = AgentTrajectory(
+            task_id="toy", outcome=1, metadata={"completion_evidence": {"verified": True}}
+        )
         from maya250m.agent import TrajectoryStep
 
         trajectory.add_step(

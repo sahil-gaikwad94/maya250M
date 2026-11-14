@@ -242,11 +242,11 @@ class TestMaya250MAndVexx35(unittest.TestCase):
         self.assertFalse(st_bad["valid"])
 
         vocab_map = {0: "compute(", 1: "1, 2)", 2: "1)", 3: "\n"}
-        accepted = vexx.verify_mtp_draft_tree(
+        accepted = vexx.filter_draft_tokens_by_grammar(
             "res = ", [0, 1, 3], vocab_map, remaining_token_budget=20, mode="python"
         )
         self.assertEqual(accepted, [0, 1, 3])
-        rejected = vexx.verify_mtp_draft_tree(
+        rejected = vexx.filter_draft_tokens_by_grammar(
             "res = ", [0, 2, 3], vocab_map, remaining_token_budget=20, mode="python"
         )
         self.assertEqual(rejected, [0])

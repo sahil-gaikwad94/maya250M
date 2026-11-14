@@ -1,4 +1,3 @@
-```python
 """Phase 0B regression suite for BUG-05, BUG-08, BUG-09 and BUG-10.
 
 * BUG-05: WY chunkwise scan must preserve a non-zero initial GDN state on the very
@@ -21,7 +20,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from maya250m import BPETokenizer, Vexx35Controller, generate_maya
+from maya250m import (
+    BPETokenizer,
+    Vexx35Controller,
+    generate_maya,
+    truncate_cache_at_token,
+)
 from tests.test_maya250m import reference_recurrent_gdn_numpy
 
 
@@ -114,6 +118,18 @@ class TestPhase0BRegressions(unittest.TestCase):
             "state": ones(1, 4, 8, 8),
             "conv": zeros(1, 3, 24),
         }
+
+        # A live bundle at position 10 still carries GDN recurrent state from token
+        # 10, which cannot be sliced back to token 4: both the snapshot and the
+        # truncation paths must fail closed instead of corrupting causal parity.
+        with self.assertRaises(ValueError):
+            truncate_cache_at_token(bundle, 4)
+        with self.assertRaises(ValueError):
+            vexx.save_checkpoint(
+                "x", token_idx=4, hybrid_cache=bundle, entropy=1.0, proposed_val=2.0
+            )
+        # A legitimate snapshot is captured *at* the jumpback token.
+        bundle["position"] = 4
 
         vexx.save_checkpoint(
             "x", token_idx=4, hybrid_cache=bundle, entropy=1.0, proposed_val=2.0
@@ -283,6 +299,152 @@ class TestPhase0BRegressions(unittest.TestCase):
         )
         self.assertEqual(errors, [])
         self.assertEqual((passed, total), (1, 1))
+
+
+    def test_p07_local_container_method_calls_are_not_masked(self):
+        """P0.7: live Tier-1 masking must allow method calls on locals/subscripts."""
+        vexx = Vexx35Controller()
+        vocab = {
+            0: "stack.append(",
+            1: "adj[u].append(",
+            2: "visited.add(",
+            3: "d.get(",
+            4: "os.system(",
+            5: "x.__class__(",
+            6: ")",
+        }
+        logits = np.zeros(len(vocab), dtype=np.float64)
+        masked = vexx.apply_in_flight_mask(
+            logits,
+            "stack = []\nadj = {}\nvisited = set()\nd = {}\n",
+            vocab,
+            remaining_token_budget=64,
+            mode="python",
+        )
+        for tid in (0, 1, 2, 3):
+            self.assertTrue(np.isfinite(masked[tid]), vocab[tid])
+        # No frame is open in the prefix, so a bare ``)`` is genuinely invalid;
+        # forbidden receivers stay blocked too.
+        for tid in (4, 5, 6):
+            self.assertFalse(np.isfinite(masked[tid]), vocab[tid])
+        # Closing a safe method call is not blocked on the receiver either.
+        closing = vexx.filter_draft_tokens_by_grammar(
+            "res = stack.append(1", [6], vocab, remaining_token_budget=16
+        )
+        self.assertEqual(closing, [6])
+
+    def test_p08_nonlocal_and_algorithmic_stdlib_execute_in_the_sandbox(self):
+        """P0.8: Tarjan with ``nonlocal`` and heap Dijkstra must execute."""
+        vexx = Vexx35Controller()
+        tarjan = (
+            "def count_scc(n, edges):\n"
+            "    graph = [[] for _ in range(n)]\n"
+            "    for u, v in edges:\n"
+            "        graph[u].append(v)\n"
+            "    index = 0\n"
+            "    indices = [-1] * n\n"
+            "    low = [0] * n\n"
+            "    on_stack = [False] * n\n"
+            "    stack = []\n"
+            "    count = 0\n"
+            "    def strongconnect(v):\n"
+            "        nonlocal index, count\n"
+            "        indices[v] = low[v] = index\n"
+            "        index += 1\n"
+            "        stack.append(v)\n"
+            "        on_stack[v] = True\n"
+            "        for w in graph[v]:\n"
+            "            if indices[w] == -1:\n"
+            "                strongconnect(w)\n"
+            "                low[v] = min(low[v], low[w])\n"
+            "            elif on_stack[w]:\n"
+            "                low[v] = min(low[v], indices[w])\n"
+            "        if low[v] == indices[v]:\n"
+            "            count += 1\n"
+            "            while True:\n"
+            "                w = stack.pop()\n"
+            "                on_stack[w] = False\n"
+            "                if w == v:\n"
+            "                    break\n"
+            "    for v in range(n):\n"
+            "        if indices[v] == -1:\n"
+            "            strongconnect(v)\n"
+            "    return count\n"
+        )
+        passed, total, errors = vexx.safe_execute_python(
+            tarjan,
+            "count_scc",
+            [{"input": [4, [[0, 1], [1, 0], [2, 3]]], "expected": 3}],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual((passed, total), (1, 1))
+
+        dijkstra = (
+            "import heapq\n"
+            "from collections import defaultdict\n"
+            "def shortest(n, edges, src):\n"
+            "    graph = defaultdict(list)\n"
+            "    for u, v, w in edges:\n"
+            "        graph[u].append((w, v))\n"
+            "    dist = {i: float('inf') for i in range(n)}\n"
+            "    dist[src] = 0\n"
+            "    queue = [(0, src)]\n"
+            "    while queue:\n"
+            "        d, u = heapq.heappop(queue)\n"
+            "        if d > dist[u]:\n"
+            "            continue\n"
+            "        for w, v in graph[u]:\n"
+            "            if d + w < dist[v]:\n"
+            "                dist[v] = d + w\n"
+            "                heapq.heappush(queue, (dist[v], v))\n"
+            "    return [dist[i] for i in range(n)]\n"
+        )
+        passed, total, errors = vexx.safe_execute_python(
+            dijkstra,
+            "shortest",
+            [{"input": [3, [[0, 1, 2], [1, 2, 3]], 0], "expected": [0, 2, 5]}],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual((passed, total), (1, 1))
+
+        blocked, _total, errors = vexx.safe_execute_python(
+            "import os\ndef f():\n    return 1\n", "f", [{"input": [], "expected": 1}]
+        )
+        self.assertEqual(blocked, 0)
+        self.assertIn("Forbidden import", errors[0])
+
+    def test_p09_incremental_lexer_matches_full_prefix_relex(self):
+        """P0.9: resumable lexing must agree with re-lexing the whole prefix."""
+        from maya250m.vexx import LexerState, advance_lexer_state
+
+        prefix = (
+            "def f(n):\n"
+            "    acc = []\n"
+            "    for i in range(n):\n"
+            "        acc.append(str(i))\n"
+            '    text = f"value={n} and None"\n'
+            "    return text, acc\n"
+        )
+        pieces = [
+            "x", " ", "\n", "(", ")", "[", "]", "{", "}", ",", ":", "=",
+            '"', '\'"\'"\'"', 'f"', "'", "#c", "name", ".", "1", "_", "{",
+        ]
+        base = advance_lexer_state(LexerState(), prefix)
+        for piece in pieces:
+            incremental = advance_lexer_state(base, piece)
+            full = advance_lexer_state(LexerState(), prefix + piece)
+            self.assertEqual(incremental.valid, full.valid, piece)
+            if full.valid:
+                self.assertEqual(incremental.stack, full.stack, piece)
+                self.assertEqual(incremental.in_str, full.in_str, piece)
+                self.assertEqual(incremental.f_brace_depth, full.f_brace_depth, piece)
+
+        # A triple-quote opener split across three chunks must still be recognised.
+        state = advance_lexer_state(LexerState(), "x = f")
+        state = advance_lexer_state(state, '"')
+        state = advance_lexer_state(state, '""')
+        self.assertEqual(state.in_str, '"""')
+        self.assertTrue(state.f_mode)
 
 
 if __name__ == "__main__":

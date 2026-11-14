@@ -27,7 +27,7 @@ __all__ = [
     "OUTPUT_FORMATS",
     "parse_task_spec",
     "validate_task_spec",
-    "constraint_coverage",
+    "lexical_requirement_coverage",
     "NeuralTaskSpecParser",
 ]
 
@@ -374,12 +374,13 @@ _ALIASES = {
 }
 
 
-def constraint_coverage(spec: TaskSpec, answer_text: str) -> Dict[str, bool]:
-    """Check whether each spec constraint is *addressed* by an answer or patch.
+def lexical_requirement_coverage(spec: TaskSpec, answer_text: str) -> Dict[str, bool]:
+    """Check whether each requirement is *mentioned* by an answer or patch.
 
-    This is a deterministic lexical audit, not a truth judgement: it exists so a
-    reasoning state can flag constraints that were never mentioned at all before
-    claiming completion.
+    This is a deterministic lexical audit, **not** verification: a matched keyword
+    is ``addressed`` at best. Callers must not treat ``True`` here as proof that a
+    requirement is satisfied; use :mod:`maya250m.requirement_evidence` for typed,
+    evidence-backed checks.
     """
     if not isinstance(answer_text, str):
         raise TypeError("answer_text must be a string")

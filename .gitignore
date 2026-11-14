@@ -1,0 +1,12 @@
+# Local virtual environments (created per checkout; never commit them)
+.venv/
+venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Checkpoints / generated evaluation output
+*.pt
+*.ckpt

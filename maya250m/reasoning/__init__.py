@@ -5,11 +5,14 @@ from __future__ import annotations
 from .controller import DEFAULT_DIFFICULTY_WEIGHTS, AdaptiveLoopController
 from .correction import CorrectionPlan, CorrectionPolicy, diagnose_failure
 from .decompose import (
+    RESEARCH_STRATEGY,
     STRATEGIES,
     Decomposition,
     DecompositionError,
     StrategySelector,
     Subproblem,
+    certify_universal_claim,
+    counterexample_first_plan,
     decompose_task,
 )
 from .state import (
@@ -33,7 +36,10 @@ __all__ = [
     "CorrectionPlan",
     "CorrectionPolicy",
     "diagnose_failure",
+    "RESEARCH_STRATEGY",
     "STRATEGIES",
+    "certify_universal_claim",
+    "counterexample_first_plan",
     "Decomposition",
     "DecompositionError",
     "StrategySelector",

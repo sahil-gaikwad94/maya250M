@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from ..understanding import TaskSpec, constraint_coverage
+from ..understanding import TaskSpec, lexical_requirement_coverage
 from ..verification import VerificationResult, failure, ok
 from .identity import (
     EvalReport,
@@ -30,7 +30,7 @@ __all__ = [
     "run_benchmark",
     "exact_match_verifier",
     "contains_all_verifier",
-    "constraint_verifier",
+    "lexical_constraint_verifier",
     "unit_test_verifier",
     "composed_verifier",
 ]
@@ -232,17 +232,31 @@ def contains_all_verifier(required: Sequence[str], case_sensitive: bool = False)
     return verify
 
 
-def constraint_verifier(spec: TaskSpec) -> Verifier:
-    """Verify every parsed constraint of a :class:`TaskSpec` is satisfied."""
+def lexical_constraint_verifier(spec: TaskSpec) -> Verifier:
+    """Check that an answer *mentions* every parsed constraint.
+
+    This is an addressing audit, not verification: the returned result is marked
+    ``lexical_only`` and must not be reported as constraint satisfaction. Use
+    :func:`maya250m.requirement_evidence.verify_requirements` for typed evidence.
+    """
 
     def verify(sample: str) -> VerificationResult:
-        coverage = constraint_coverage(spec, sample)
+        coverage = lexical_requirement_coverage(spec, sample)
         missing = [key for key, covered in coverage.items() if not covered]
         if missing:
             return failure(
-                "missing_constraint", f"{len(missing)} constraint(s) uncovered", missing=missing
+                "missing_constraint",
+                f"{len(missing)} constraint(s) not addressed",
+                missing=missing,
+                lexical_only=True,
+                status="addressed",
             )
-        return ok("all constraints covered")
+        return ok(
+            "all constraints addressed (lexical audit, not verified)",
+            lexical_only=True,
+            status="addressed",
+            verified=False,
+        )
 
     return verify
 

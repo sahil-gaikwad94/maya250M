@@ -5,6 +5,7 @@ exact mid-epoch resume, and Kaggle Free-Quota wall-clock watchdog.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -435,6 +436,7 @@ def train_maya(
     seed: int = 42,
     max_wall_hours: Optional[float] = None,
     device: Optional[torch.device] = None,
+    checkpoint_role: str = "unspecified",
 ) -> dict:
     """Deterministic, bitwise-resumable Maya-250M training loop with Kaggle wall-clock guard."""
     if len(train_dataset) == 0:
@@ -503,13 +505,15 @@ def train_maya(
         loader = DataLoader(
             sub_ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn
         )
-        batches = list(loader)
+        # Stream one gradient-accumulation group at a time. Materialising
+        # ``list(loader)`` held every remaining batch of the epoch in host RAM, which
+        # made peak memory O(epoch) instead of O(grad_accum_steps).
+        loader_iter = iter(loader)
 
-        b_idx = 0
-        while b_idx < len(batches) and step < max_steps:
-            group_batches = batches[b_idx : b_idx + grad_accum_steps]
-            b_idx += len(group_batches)
-            cursor += sum(int(b[0].shape[0]) for b in group_batches)
+        while step < max_steps:
+            group_batches = list(itertools.islice(loader_iter, int(grad_accum_steps)))
+            if not group_batches:
+                break
 
             active_mtp_d = (
                 mtp_curriculum.active_depth(step + 1)
@@ -606,6 +610,10 @@ def train_maya(
             optimizer.step()
             scheduler.step()
 
+            # Advance the resume cursor only after the whole group is consumed, so a
+            # mid-epoch checkpoint resumes at the exact next unseen sample.
+            cursor += sum(int(batch[0].shape[0]) for batch in group_batches)
+
             step += 1
             model.optimizer_updates += 1
             model.tokens_seen += int(group_lm_targets)
@@ -660,6 +668,7 @@ def train_maya(
                         "best_val_loss": best_val_loss,
                         "history": history,
                         "stopped_by_wall_clock": stopped_by_wall_clock,
+                        "checkpoint_role": str(checkpoint_role),
                     },
                     path=best_checkpoint_path,
                     extra={"val_metrics": val_metrics},
@@ -676,6 +685,7 @@ def train_maya(
         "history": history,
         "stopped_by_wall_clock": stopped_by_wall_clock,
         "val_metrics": val_metrics,
+        "checkpoint_role": str(checkpoint_role),
     }
     if checkpoint_path is not None:
         save_checkpoint_maya(

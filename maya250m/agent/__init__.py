@@ -13,7 +13,13 @@ from .firewall import (
     neutralize_markers,
     separate_messages,
 )
-from .runtime import LOOP_GUARD_TEMPLATE, AgentRuntime, ToolObservation
+from .runtime import (
+    LOOP_GUARD_TEMPLATE,
+    AgentRuntime,
+    CompletionEvidence,
+    ConstraintEvidence,
+    ToolObservation,
+)
 from .sandbox import (
     PathGuard,
     Sandbox,
@@ -51,6 +57,8 @@ __all__ = [
     "SandboxViolation",
     "LOOP_GUARD_TEMPLATE",
     "AgentRuntime",
+    "CompletionEvidence",
+    "ConstraintEvidence",
     "ToolObservation",
     "TOOL_SCHEMAS",
     "RepoTools",

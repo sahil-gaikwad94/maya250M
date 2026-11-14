@@ -6,7 +6,10 @@ import os
 import sys
 import unittest
 
-import torch
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -19,7 +22,9 @@ from maya250m.adaptive import (
 from maya250m.config import get_config
 from maya250m.evaluation import MeasurementIdentity, MeasurementStatus, exact_match_verifier
 from maya250m.generate import generate_maya
-from maya250m.model import MayaModel
+
+if torch is not None:
+    from maya250m.model import MayaModel
 from maya250m.reasoning.controller import AdaptiveLoopController
 from maya250m.tokenizer import BPETokenizer
 from maya250m.understanding import parse_task_spec
@@ -73,6 +78,7 @@ class TestLoopSelection(unittest.TestCase):
         self.assertGreaterEqual(retried, clean)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestGenerationWithLoops(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -209,6 +215,7 @@ class TestSolveTask(unittest.TestCase):
         )
         self.assertEqual(off.subgoals, [])
 
+    @unittest.skipIf(torch is None, "PyTorch not installed")
     def test_end_to_end_with_real_model(self):
         tokenizer = BPETokenizer()
         model = _tiny_model(tokenizer, seed=8)

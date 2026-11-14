@@ -13,6 +13,7 @@ import math
 import os
 import re
 import tempfile
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +35,8 @@ from .tokenizer import (
 __all__ = [
     "Vexx35Controller",
     "Vexx3Controller",
+    "LexerState",
+    "advance_lexer_state",
     "safe_sympy",
     "clone_cache_generic",
     "truncate_cache_at_token",
@@ -57,14 +60,45 @@ def clone_cache_generic(cache: Any) -> Any:
     return copy.deepcopy(cache)
 
 
+def _contains_recurrent_state(node: Any) -> bool:
+    """True when ``node`` holds GDN recurrent state (no sequence dimension)."""
+    if isinstance(node, dict):
+        if "state" in node or "conv" in node:
+            return True
+        return any(_contains_recurrent_state(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_contains_recurrent_state(item) for item in node)
+    return False
+
+
 def truncate_cache_at_token(cache: Any, tok_idx: int) -> Any:
-    """Recursively truncate Full-Attention KV tensors at ``tok_idx`` (v1 or v2 caches)."""
+    """Recursively truncate Full-Attention KV tensors at ``tok_idx`` (v1 or v2 caches).
+
+    GDN recurrent state matrices carry no sequence dimension, so they cannot be
+    sliced back in time. Truncating a bundle whose ``position`` is ahead of
+    ``tok_idx`` while it still contains recurrent state would silently keep future
+    tokens inside ``S_t`` and corrupt causal parity, so that case fails closed: take
+    an exact snapshot at ``tok_idx`` (``save_checkpoint``) or replay the prefix with
+    :func:`maya250m.cache.rewind_cache` instead.
+    """
     tok_idx = int(tok_idx)
     if isinstance(cache, list):
         for item in cache:
             truncate_cache_at_token(item, tok_idx)
         return cache
     if isinstance(cache, dict):
+        position = cache.get("position")
+        if (
+            position is not None
+            and int(position) > tok_idx
+            and _contains_recurrent_state(cache)
+        ):
+            raise ValueError(
+                f"cannot truncate a hybrid cache at token {tok_idx}: it is at "
+                f"position {int(position)} and carries GDN recurrent state with no "
+                "sequence axis; restore an exact snapshot taken at that token or "
+                "replay the prefix with rewind_cache"
+            )
         if "k" in cache and "v" in cache and hasattr(cache["k"], "shape"):
             if cache["k"].shape[2] > tok_idx:
                 cache["k"] = cache["k"][:, :, :tok_idx, :]
@@ -80,9 +114,35 @@ def truncate_cache_at_token(cache: Any, tok_idx: int) -> Any:
 
 
 _SANDBOX_DRIVER = r'''
-import contextlib, io, json, os, sys
+import builtins as _builtins, contextlib, io, json, os, sys
+
 payload = json.load(sys.stdin)
+
+_ALLOWED_MODULES = frozenset({
+    "math", "heapq", "collections", "bisect", "itertools", "functools",
+    "typing", "fractions", "decimal", "operator", "string",
+})
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = str(name).split(".")[0]
+    if int(level or 0) != 0 or root not in _ALLOWED_MODULES:
+        raise ImportError("sandbox forbids import of %r" % (name,))
+    for item in (fromlist or ()):
+        if str(item).startswith("_"):
+            raise ImportError("sandbox forbids private import %r" % (item,))
+    return _builtins.__import__(name, globals, locals, fromlist, level)
+
+
 SAFE = {
+    "__import__": _safe_import,
+    "__build_class__": _builtins.__build_class__,
+    "object": object,
+    "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+    "IndexError": IndexError, "KeyError": KeyError, "AttributeError": AttributeError,
+    "ZeroDivisionError": ZeroDivisionError, "RuntimeError": RuntimeError,
+    "StopIteration": StopIteration, "ArithmeticError": ArithmeticError,
+    "AssertionError": AssertionError,
     "abs": abs, "all": all, "any": any, "bool": bool, "chr": chr, "dict": dict,
     "divmod": divmod, "enumerate": enumerate, "filter": filter, "float": float,
     "int": int, "isinstance": isinstance, "len": len, "list": list, "map": map,
@@ -91,8 +151,9 @@ SAFE = {
     "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
     "True": True, "False": False, "None": None,
 }
+
 mode = payload.get("mode", "fn_call")
-ns = {"__builtins__": SAFE}
+ns = {"__builtins__": SAFE, "__name__": "__maya_sandbox__"}
 try:
     if mode == "experiment_script":
         buf = io.StringIO()
@@ -111,7 +172,6 @@ except BaseException as exc:
     print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
 '''
 
-
 def _limit_child() -> None:
     import resource
 
@@ -125,6 +185,28 @@ _MAX_EXPR_CHARS = 512
 _MAX_EXPR_NODES = 200
 _MAX_EXPONENT = 10_000
 _MAX_INT_BITS = 4096
+_MAX_FACTORIAL_ARG = 5000
+_MAX_BINOMIAL_N = 100_000
+
+
+def _bounded_factorial(value: Any) -> Any:
+    """``factorial`` with a hard argument cap against CPU denial of service."""
+    number = sp.sympify(value)
+    if number.is_number:
+        if abs(int(number)) > _MAX_FACTORIAL_ARG:
+            raise ValueError(f"factorial argument above {_MAX_FACTORIAL_ARG}")
+    return sp.factorial(number)
+
+
+def _bounded_binomial(n: Any, k: Any) -> Any:
+    """``binomial``/``comb`` with hard argument caps."""
+    nn, kk = sp.sympify(n), sp.sympify(k)
+    for value in (nn, kk):
+        if value.is_number and abs(int(value)) > _MAX_BINOMIAL_N:
+            raise ValueError(f"binomial argument above {_MAX_BINOMIAL_N}")
+    return sp.binomial(nn, kk)
+
+
 _ALLOWED_FUNCS = {
     "sqrt": sp.sqrt,
     "exp": sp.exp,
@@ -134,6 +216,23 @@ _ALLOWED_FUNCS = {
     "tan": sp.tan,
     "abs": sp.Abs,
     "Abs": sp.Abs,
+    # Number theory & combinatorics (competition-maths CAS splices).
+    "gcd": sp.gcd,
+    "lcm": sp.lcm,
+    "binomial": _bounded_binomial,
+    "comb": _bounded_binomial,
+    "factorial": _bounded_factorial,
+    "isprime": sp.isprime,
+    "totient": sp.totient,
+    "Mod": sp.Mod,
+    # Rounding & algebra.
+    "floor": sp.floor,
+    "ceil": sp.ceiling,
+    "ceiling": sp.ceiling,
+    "Rational": sp.Rational,
+    "sign": sp.sign,
+    "Min": sp.Min,
+    "Max": sp.Max,
 }
 _ALLOWED_BINOPS = {
     ast.Add: lambda a, b: a + b,
@@ -201,13 +300,304 @@ def safe_sympy(expr: str, env: Optional[Dict[str, Any]] = None) -> sp.Expr:
             return _ALLOWED_FUNCS[node.func.id](*[build(arg) for arg in node.args])
         raise ValueError(f"disallowed syntax: {type(node).__name__}")
 
-    return build(tree)
+    result = build(tree)
+    if isinstance(result, bool):
+        return sp.true if result else sp.false
+    return result
+
+
+# --------------------------------------------------------------------- lexer
+#
+# Tier-1 in-flight masking must decide, for every vocabulary entry, whether the
+# token is syntactically legal after the current prefix. Re-lexing the whole
+# prefix for all ``|V|`` candidates costs ``O(|V| * L)`` character steps per decode
+# step, which at ``L = 4096`` exceeds 10^8 Python loop iterations per token. The
+# resumable state below scans only the appended characters, making each candidate
+# cost ``O(len(token))``.
+
+_CALLEE_KEYWORDS = frozenset(
+    {
+        "if", "while", "for", "return", "elif", "assert", "not", "and", "or",
+        "in", "def", "class", "lambda", "with", "yield", "del", "await", "from",
+        "raise", "import", "except", "finally", "match", "case", "global",
+    }
+)
+_BRACKET_PAIRS = {("(", ")"), ("[", "]"), ("{", "}")}
+_STRING_START_RE = re.compile(r"^([rRfFbB]{0,2})('''|\"\"\"|'|\")")
+#: A trailing run that might still grow into a triple-quoted string.
+_PARTIAL_STRING_RE = re.compile(r"[rRfFbB]{0,2}(?:'''|\"\"\"|''|\"\"|'|\")\Z")
+
+
+@dataclass
+class LexerState:
+    """Resumable Python lexer state for incremental in-flight masking.
+
+    ``stack`` holds open delimiters as ``(delimiter, callee, comma_count)`` where
+    ``callee`` is the dotted name immediately before an opening ``(``.
+    ``closed_frames`` reports only the frames closed while scanning the most recent
+    chunk, which is exactly what a token-closing candidate needs.
+    """
+
+    valid: bool = True
+    reason: Optional[str] = None
+    in_str: Optional[str] = None
+    raw_str: bool = False
+    f_mode: bool = False
+    f_brace_depth: int = 0
+    stack: List[Tuple[str, Optional[str], int]] = field(default_factory=list)
+    closed_frames: List[Tuple[str, Optional[str], int]] = field(default_factory=list)
+    last_ident: str = ""
+    prev_non_ws: str = ""
+    last_line: str = ""
+    pending: str = ""
+    string_open_at: int = -1
+
+    def clone(self) -> "LexerState":
+        """Copy the state, dropping per-chunk ``closed_frames``."""
+        return LexerState(
+            valid=self.valid,
+            reason=self.reason,
+            in_str=self.in_str,
+            raw_str=self.raw_str,
+            f_mode=self.f_mode,
+            f_brace_depth=self.f_brace_depth,
+            stack=list(self.stack),
+            closed_frames=[],
+            last_ident=self.last_ident,
+            prev_non_ws=self.prev_non_ws,
+            last_line=self.last_line,
+            pending=self.pending,
+            string_open_at=self.string_open_at,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Legacy dictionary view consumed by existing callers and tests."""
+        return {
+            "valid": self.valid,
+            "reason": self.reason,
+            "stack": list(self.stack),
+            "closed_frames": list(self.closed_frames),
+            "in_str": self.in_str,
+            "f_brace_depth": self.f_brace_depth,
+            "last_ident": self.last_ident,
+            "prev_non_ws": self.prev_non_ws,
+            "pending": self.pending,
+        }
+
+
+def advance_lexer_state(state: LexerState, chunk: str, reset_closed: bool = True) -> LexerState:
+    """Advance ``state`` over ``chunk`` in ``O(len(chunk))`` character steps.
+
+    Only a genuinely incomplete trailing string opener (``f"`` / ``""`` / ``'''``
+    split across chunk boundaries) is carried into ``state.pending`` and re-scanned
+    with the next chunk, so token boundaries cannot silently change how a quote is
+    interpreted.
+    """
+    st = state.clone()
+    if reset_closed:
+        st.closed_frames = []
+    if not st.valid or not chunk:
+        return st
+
+    text = (st.pending + chunk) if st.pending else chunk
+    st.pending = ""
+    n = len(text)
+
+    hold = -1
+    hold_state: Optional[LexerState] = None
+    m_partial = _PARTIAL_STRING_RE.search(text)
+    if m_partial is not None:
+        run = m_partial.group(0)
+        quote = run[-1]
+        if len(run) - len(run.rstrip(quote)) < 3:
+            hold = m_partial.start()
+
+    i = 0
+    while i < n and st.valid:
+        if hold == i:
+            hold_state = st.clone()
+        ch = text[i]
+
+        if st.in_str == "#":
+            if ch == "\n":
+                st.in_str = None
+                st.prev_non_ws = "\n"
+                st.last_line = ""
+            i += 1
+            continue
+
+        if st.in_str is not None:
+            if st.f_mode and st.f_brace_depth == 0 and ch == "{":
+                if i + 1 < n and text[i + 1] == "{":
+                    i += 2
+                    continue
+                st.f_brace_depth = 1
+                st.stack.append(("(", None, 0))
+                i += 1
+                continue
+            if st.f_mode and st.f_brace_depth > 0:
+                if ch in "'\"":
+                    st.valid = False
+                    st.reason = "quote_in_fstring_expression"
+                    break
+                if ch == "{":
+                    st.f_brace_depth += 1
+                elif ch == "}":
+                    st.f_brace_depth -= 1
+                    if st.f_brace_depth == 0 and st.stack and st.stack[-1][0] == "(":
+                        st.stack.pop()
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text.startswith(st.in_str, i):
+                i += len(st.in_str)
+                st.in_str = None
+                st.f_mode = False
+                st.raw_str = False
+                continue
+            i += 1
+            continue
+
+        if ch == "#":
+            st.in_str = "#"
+            i += 1
+            continue
+
+        m_str = _STRING_START_RE.match(text[i:])
+        if m_str:
+            flags = m_str.group(1).lower()
+            st.in_str = m_str.group(2)
+            st.f_mode = "f" in flags
+            st.raw_str = "r" in flags
+            st.string_open_at = i
+            st.last_ident = ""
+            i += len(m_str.group(0))
+            continue
+
+        if ch in "([{":
+            callee = None
+            if ch == "(" and st.last_ident and st.last_ident not in _CALLEE_KEYWORDS:
+                callee = st.last_ident
+            st.stack.append((ch, callee, 0))
+            st.last_ident = ""
+            st.prev_non_ws = ch
+            st.last_line = (st.last_line + ch)[-256:]
+            i += 1
+            continue
+
+        if ch in ")]}":
+            if not st.stack:
+                st.valid = False
+                st.reason = "unmatched_close"
+                break
+            open_ch, _callee, _count = st.stack[-1]
+            if (open_ch, ch) not in _BRACKET_PAIRS:
+                st.valid = False
+                st.reason = "mismatched_close"
+                break
+            st.closed_frames.append(st.stack.pop())
+            st.last_ident = ""
+            st.prev_non_ws = ch
+            st.last_line = (st.last_line + ch)[-256:]
+            i += 1
+            continue
+
+        if ch == "," and st.stack:
+            delim, call, count = st.stack[-1]
+            st.stack[-1] = (delim, call, count + 1)
+            st.last_ident = ""
+            i += 1
+            continue
+
+        if ch.isalnum() or ch in "_.":
+            st.last_ident = (st.last_ident + ch)[-160:]
+        elif not ch.isspace():
+            st.last_ident = ""
+
+        if ch == "\n":
+            st.last_line = ""
+        else:
+            st.last_line = (st.last_line + ch)[-256:]
+        if not ch.isspace():
+            st.prev_non_ws = ch
+        i += 1
+
+    if (
+        st.valid
+        and hold >= 0
+        and hold_state is not None
+        and st.in_str is not None
+        and st.string_open_at >= hold
+    ):
+        # The trailing quote run is still undecided (single vs triple quoted), and a
+        # string prefix may sit in the previous chunk (``f`` + ``"""``). Carry both
+        # so the next chunk re-decides the token exactly as a full re-lex would.
+        st = hold_state
+        st.closed_frames = []
+        prefix = ""
+        prefix_match = re.fullmatch(r"[rRfFbB]{1,2}", st.last_ident)
+        if prefix_match is not None:
+            prefix = prefix_match.group(0)
+            st.last_ident = ""
+        st.pending = prefix + text[hold:]
+
+    return st
+
+
+_VOCAB_STATIC_CACHE: Dict[Any, Tuple[np.ndarray, np.ndarray, Tuple[Tuple[int, str, int], ...]]] = {}
+_VOCAB_STATIC_CACHE_MAX = 8
+
+
+def _static_vocab_masks(
+    vocab_map: Dict[int, str], tokenizer_hash: Optional[str] = None
+) -> Tuple[np.ndarray, np.ndarray, Tuple[Tuple[int, str, int], ...]]:
+    """Classify a vocabulary once into never-emit / protocol / legal-candidate ids."""
+    key: Any = tokenizer_hash or f"id:{id(vocab_map)}:{len(vocab_map)}"
+    cached = _VOCAB_STATIC_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    never_ids: List[int] = []
+    protocol_ids: List[int] = []
+    entries: List[Tuple[int, str, int]] = []
+    for tid, tok_str in vocab_map.items():
+        category = token_category(tok_str)
+        if category == NEVER_EMIT:
+            never_ids.append(int(tid))
+        elif category == PROTOCOL_MARKERS:
+            protocol_ids.append(int(tid))
+        else:
+            entries.append((int(tid), tok_str, -1 if category is None else int(category)))
+
+    result = (
+        np.asarray(never_ids, dtype=np.int64),
+        np.asarray(protocol_ids, dtype=np.int64),
+        tuple(entries),
+    )
+    if len(_VOCAB_STATIC_CACHE) >= _VOCAB_STATIC_CACHE_MAX:
+        _VOCAB_STATIC_CACHE.pop(next(iter(_VOCAB_STATIC_CACHE)))
+    _VOCAB_STATIC_CACHE[key] = result
+    return result
 
 
 class Vexx35Controller:
     """Stateful six-tier neuro-symbolic controller for Maya-250M."""
 
-    FORBIDDEN_AST_NODES = (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)
+    #: ``ast.Nonlocal`` only rebinds names in an enclosing function frame and has
+    #: no sandbox-escape surface; blocking it rejected textbook Tarjan SCC
+    #: solutions that use ``nonlocal`` for the SCC counters.
+    FORBIDDEN_AST_NODES = (ast.Global,)
+    #: Pure algorithmic standard-library modules a candidate may import. ``os``,
+    #: ``sys``, ``socket``, ``subprocess``, ``pathlib`` and friends stay blocked at
+    #: both the AST layer and the runtime ``__import__`` layer.
+    ALLOWED_STDLIB_MODULES = frozenset(
+        {
+            "math", "heapq", "collections", "bisect", "itertools",
+            "functools", "typing", "fractions", "decimal", "operator", "string",
+        }
+    )
     FORBIDDEN_IDENTIFIERS = {
         "os", "sys", "subprocess", "socket", "shutil", "pathlib", "open",
         "eval", "exec", "compile", "__import__", "globals", "locals",
@@ -231,6 +621,23 @@ class Vexx35Controller:
         }
     )
 
+    #: Standard container/string methods that are safe to call on a local variable,
+    #: a subscript or an attribute chain. Before this allow-list, Tier-1 masking
+    #: rejected every method call whose receiver was not literally ``self``/``cls``,
+    #: so Python generation could not emit ``stack.append(x)``, ``adj[u].append(v)``
+    #: or ``d.get(k, 0)`` at all.
+    SAFE_STANDARD_METHODS = frozenset(
+        {
+            "append", "appendleft", "add", "clear", "copy", "count",
+            "difference", "difference_update", "discard", "extend", "extendleft",
+            "fromkeys", "get", "index", "insert", "intersection",
+            "intersection_update", "issubset", "issuperset", "items", "keys",
+            "pop", "popleft", "popitem", "remove", "reverse", "rotate",
+            "setdefault", "sort", "symmetric_difference",
+            "symmetric_difference_update", "union", "update", "values",
+        }
+    ) | SAFE_LITERAL_ATTRIBUTES
+
     def __init__(
         self,
         domain_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -244,6 +651,10 @@ class Vexx35Controller:
         self.checkpoints: List[Dict[str, Any]] = []
         self.dpo_buffer: List[Dict[str, Any]] = []
         self.last_exact_fraction: Optional[Fraction] = None
+        #: Verified definitions carried across ``<experiment>`` cells in one episode.
+        self.experiment_preamble: List[str] = []
+        self._symbol_cache: Dict[Any, Dict[str, Dict[str, Any]]] = {}
+        self._accumulated_symbols: Dict[str, Dict[str, Any]] = dict(self.symbol_table)
 
     @staticmethod
     def crane_phase(prefix_text: str) -> str:
@@ -347,130 +758,63 @@ class Vexx35Controller:
 
     @staticmethod
     def _lex_code_state(code_prefix: str) -> Dict[str, Any]:
-        i = 0
-        n = len(code_prefix)
-        in_str: Optional[str] = None
-        f_mode = False
-        f_brace_depth = 0
-        stack: List[Tuple[str, Optional[str], int]] = []
-        closed_frames: List[Tuple[str, Optional[str], int]] = []
-        sanitized: List[str] = []
+        """Lex a complete code prefix from a fresh :class:`LexerState`.
 
-        while i < n:
-            ch = code_prefix[i]
-            if in_str is not None and in_str != "#":
-                if f_mode and f_brace_depth == 0 and ch == "{":
-                    if i + 1 < n and code_prefix[i + 1] == "{":
-                        sanitized.append("  ")
-                        i += 2
-                        continue
-                    f_brace_depth = 1
-                    sanitized.append("(")
-                    stack.append(("(", None, 0))
-                    i += 1
-                    continue
-                if f_mode and f_brace_depth > 0:
-                    if ch in "'\"":
-                        return {
-                            "valid": False,
-                            "reason": "quote_in_fstring_expression",
-                            "stack": stack,
-                            "in_str": in_str,
-                        }
-                    if ch == "{":
-                        f_brace_depth += 1
-                    elif ch == "}":
-                        f_brace_depth -= 1
-                        if f_brace_depth == 0:
-                            sanitized.append(")")
-                            if stack and stack[-1][0] == "(":
-                                stack.pop()
-                            i += 1
-                            continue
-                else:
-                    if ch == "\\" and i + 1 < n:
-                        sanitized.append("  ")
-                        i += 2
-                        continue
-                    if code_prefix.startswith(in_str, i):
-                        sanitized.append(" " * len(in_str))
-                        i += len(in_str)
-                        in_str = None
-                        f_mode = False
-                        continue
-                    sanitized.append(" ")
-                    i += 1
-                    continue
-            elif in_str == "#":
-                if ch == "\n":
-                    in_str = None
-                    sanitized.append("\n")
-                else:
-                    sanitized.append(" ")
-                i += 1
-                continue
+        Retained for callers that need a full-prefix snapshot; the decode loop uses
+        the incremental :func:`advance_lexer_state` instead.
+        """
+        return advance_lexer_state(LexerState(), code_prefix).to_dict()
 
-            if ch == "#":
-                in_str = "#"
-                sanitized.append(" ")
-                i += 1
-                continue
+    def _live_symbol_table(self, active_code: str) -> Dict[str, Dict[str, Any]]:
+        """Contracts for in-flight code without re-parsing the whole prefix.
 
-            m_str = re.match(r"^([rRfFbB]{0,2})('''|\"\"\"|'|\")", code_prefix[i:])
-            if m_str:
-                prefix_flags, quote_tok = m_str.group(1).lower(), m_str.group(2)
-                in_str = quote_tok
-                f_mode = "f" in prefix_flags
-                full_len = len(m_str.group(0))
-                sanitized.append(" " * full_len)
-                i += full_len
-                continue
+        The full prefix is never re-parsed per token: a bounded tail window is
+        scanned (so a definition split across the window boundary is still seen on
+        the next step) and merged into the accumulated table.
+        """
+        window = 4096
+        tail = active_code[-window:]
+        key = (len(active_code), tail[-128:])
+        cached = self._symbol_cache.get(key)
+        if cached is not None:
+            return cached
+        merged = dict(self._accumulated_symbols)
+        merged.update(self.extract_ast_symbol_table(tail))
+        self._accumulated_symbols = merged
+        if len(self._symbol_cache) >= 8:
+            self._symbol_cache.pop(next(iter(self._symbol_cache)))
+        self._symbol_cache[key] = merged
+        return merged
 
-            sanitized.append(ch)
-            if ch in "([{":
-                callee = None
-                if ch == "(":
-                    before = "".join(sanitized[:-1]).rstrip()
-                    m_call = re.search(r"([A-Za-z_][A-Za-z0-9_.]*)$", before)
-                    if m_call:
-                        ident = m_call.group(1)
-                        if ident not in {
-                            "if", "while", "for", "return", "elif", "assert",
-                            "not", "and", "or", "in", "def", "class", "lambda", "with",
-                        }:
-                            callee = ident
-                stack.append((ch, callee, 0))
-            elif ch in ")]}":
-                if not stack:
-                    return {
-                        "valid": False,
-                        "reason": "unmatched_close",
-                        "stack": stack,
-                        "in_str": in_str,
-                    }
-                open_ch, _, _ = stack[-1]
-                if (open_ch, ch) in {("(", ")"), ("[", "]"), ("{", "}")}:
-                    closed_frames.append(stack.pop())
-                else:
-                    return {
-                        "valid": False,
-                        "reason": "mismatched_close",
-                        "stack": stack,
-                        "in_str": in_str,
-                    }
-            elif ch == "," and stack:
-                top_d, top_c, top_cnt = stack[-1]
-                stack[-1] = (top_d, top_c, top_cnt + 1)
-            i += 1
+    @classmethod
+    def _classify_callee(
+        cls, callee: str, live_syms: Dict[str, Dict[str, Any]]
+    ) -> Tuple[Optional[str], bool]:
+        """Resolve a call target to ``(callee_key, is_safe_standard_method)``.
 
-        return {
-            "valid": True,
-            "stack": stack,
-            "closed_frames": closed_frames,
-            "in_str": in_str,
-            "f_brace_depth": f_brace_depth,
-            "sanitized": "".join(sanitized),
-        }
+        ``(None, False)`` means the call must be masked. Ordinary container/string
+        methods on local variables, subscripts and attribute chains are allowed
+        (``stack.append(x)``, ``adj[u].append(v)``, ``d.get(k, 0)``); dunder
+        attributes, forbidden names and unknown non-standard methods stay blocked.
+        """
+        if "." in callee:
+            recv, meth = callee.rsplit(".", 1)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", meth):
+                return None, False
+            if meth.startswith("__") or meth in cls.FORBIDDEN_IDENTIFIERS:
+                return None, False
+            if recv in {"self", "cls"}:
+                if live_syms and meth not in live_syms:
+                    return None, False
+                return meth, False
+            if meth in live_syms:
+                return meth, False
+            if meth in cls.SAFE_STANDARD_METHODS:
+                return meth, True
+            return None, False
+        if callee in cls.FORBIDDEN_IDENTIFIERS:
+            return None, False
+        return callee, False
 
     def apply_in_flight_mask(
         self,
@@ -480,28 +824,31 @@ class Vexx35Controller:
         expected_return_type: Optional[str] = None,
         remaining_token_budget: int = 256,
         mode: str = "python",
+        tokenizer_hash: Optional[str] = None,
     ) -> np.ndarray:
-        """Apply Tier 0 + Tier 1 constraints to next-token logits."""
+        """Apply Tier 0 + Tier 1 constraints to next-token logits.
+
+        The prefix is lexed once. Each candidate token is then advanced through
+        ``advance_lexer_state`` over its own characters only, so a decode step is
+        ``O(|V| * token_len + L)`` instead of ``O(|V| * L)``. Token categories are
+        cached per vocabulary and symbol contracts come from a bounded tail window.
+        """
         if logits.ndim != 1:
             raise ValueError(f"logits must be 1-D [vocab], got shape {tuple(logits.shape)}")
         masked = np.array(logits, dtype=np.float64, copy=True)
-
-        for tid, tok_str in vocab_map.items():
-            if tid < 0 or tid >= masked.shape[-1]:
-                raise ValueError(f"vocabulary id {tid} out of range")
-            if token_category(tok_str) == NEVER_EMIT:
-                masked[tid] = -np.inf
+        never_ids, protocol_ids, entries = _static_vocab_masks(vocab_map, tokenizer_hash)
+        if never_ids.size:
+            masked[never_ids] = -np.inf
 
         phase = self.crane_phase(prefix_text)
 
-        for tid, tok_str in vocab_map.items():
-            if token_category(tok_str) != PROTOCOL_MARKERS:
-                continue
+        for tid in protocol_ids.tolist():
+            tok_str = vocab_map.get(int(tid), "")
             if phase == "UNCONSTRAINED_THINK" and tok_str in (THINK_END, EXP_START):
                 continue
             if phase == "EXPERIMENT_DESIGN" and tok_str == EXP_END:
                 continue
-            masked[tid] = -np.inf
+            masked[int(tid)] = -np.inf
 
         if phase == "UNCONSTRAINED_THINK" and remaining_token_budget > 4:
             return masked
@@ -514,63 +861,63 @@ class Vexx35Controller:
             if phase == "EXPERIMENT_DESIGN"
             else prefix_text
         )
-        live_syms = dict(self.symbol_table)
-        live_syms.update(self.extract_ast_symbol_table(active_code))
-        base_state = self._lex_code_state(active_code)
-        open_depth = len(base_state.get("stack", []))
+        live_syms = self._live_symbol_table(active_code)
+        base_state = advance_lexer_state(LexerState(), active_code)
+        open_depth = len(base_state.stack)
 
-        for tid, tok_str in vocab_map.items():
-            cat = token_category(tok_str)
-            if cat == NEVER_EMIT or cat == PROTOCOL_MARKERS:
-                continue
-
+        for tid, tok_str, _cat in entries:
             if remaining_token_budget <= open_depth + 1 and any(c in tok_str for c in "([{"):
                 masked[tid] = -np.inf
                 continue
 
-            cand_text = active_code + tok_str
-            st = self._lex_code_state(cand_text)
-            if not st["valid"]:
+            st = advance_lexer_state(base_state, tok_str)
+            if not st.valid:
                 masked[tid] = -np.inf
                 continue
 
-            if "(" in tok_str and st["in_str"] is None and st["stack"]:
-                _, callee, _ = st["stack"][-1]
+            if "(" in tok_str and st.in_str is None and st.stack:
+                _, callee, _ = st.stack[-1]
                 if callee is not None:
-                    if "." in callee:
-                        recv, meth = callee.rsplit(".", 1)
-                        if recv not in {"self", "cls"}:
-                            masked[tid] = -np.inf
-                            continue
-                        if live_syms and meth not in live_syms:
-                            masked[tid] = -np.inf
-                            continue
-                        callee_key = meth
-                    else:
-                        callee_key = callee
-
-                    last_line = cand_text.splitlines()[-1].lstrip() if cand_text.splitlines() else ""
-                    if not last_line.startswith(("def ", "@")) and phase != "EXPERIMENT_DESIGN":
-                        if callee_key not in live_syms:
-                            masked[tid] = -np.inf
-                            continue
-                        ret = live_syms[callee_key].get("return_type")
-                        if expected_return_type and ret not in {expected_return_type, "any"}:
-                            masked[tid] = -np.inf
-                            continue
-
-            if ")" in tok_str and base_state["valid"] and st.get("closed_frames"):
-                closed_delim, closed_callee, comma_cnt = st["closed_frames"][-1]
-                if closed_delim == "(" and closed_callee is not None:
-                    if "." in closed_callee and closed_callee.rsplit(".", 1)[0] not in {"self", "cls"}:
+                    callee_key, safe_method = self._classify_callee(callee, live_syms)
+                    if callee_key is None:
                         masked[tid] = -np.inf
                         continue
-                    callee_key = closed_callee.rsplit(".", 1)[-1]
-                    last_line = active_code.splitlines()[-1].lstrip() if active_code.splitlines() else ""
-                    if callee_key in live_syms and not last_line.startswith(("def ", "@")):
-                        lparen = cand_text.rfind("(")
-                        rparen = cand_text.rfind(")")
-                        inner_call = cand_text[lparen + 1 : rparen].strip() if rparen > lparen else ""
+                    if not safe_method:
+                        last_line = st.last_line.lstrip()
+                        if not last_line.startswith(("def ", "@")) and phase != "EXPERIMENT_DESIGN":
+                            if callee_key not in live_syms:
+                                masked[tid] = -np.inf
+                                continue
+                            ret = live_syms[callee_key].get("return_type")
+                            if expected_return_type and ret not in {expected_return_type, "any"}:
+                                masked[tid] = -np.inf
+                                continue
+
+            if ")" in tok_str and base_state.valid and st.closed_frames:
+                closed_delim, closed_callee, comma_cnt = st.closed_frames[-1]
+                if closed_delim == "(" and closed_callee is not None:
+                    callee_key, safe_method = self._classify_callee(closed_callee, live_syms)
+                    if callee_key is None:
+                        masked[tid] = -np.inf
+                        continue
+                    last_line = base_state.last_line.lstrip()
+                    if (
+                        not safe_method
+                        and callee_key in live_syms
+                        and not last_line.startswith(("def ", "@"))
+                    ):
+                        tok_lparen = tok_str.rfind("(")
+                        lparen = (
+                            len(active_code) + tok_lparen
+                            if tok_lparen != -1
+                            else active_code.rfind("(")
+                        )
+                        rparen = len(active_code) + tok_str.rfind(")")
+                        inner_call = (
+                            (active_code + tok_str)[lparen + 1 : rparen].strip()
+                            if rparen > lparen
+                            else ""
+                        )
                         if inner_call.endswith(",") and comma_cnt >= 1:
                             masked[tid] = -np.inf
                             continue
@@ -584,6 +931,37 @@ class Vexx35Controller:
                                 continue
 
         return masked
+
+    def filter_draft_tokens_by_grammar(
+        self,
+        prefix_text: str,
+        draft_token_ids: List[int],
+        vocab_map: Dict[int, str],
+        remaining_token_budget: int = 256,
+        mode: str = "python",
+    ) -> List[int]:
+        """Prune speculative draft tokens that violate Vexx Tier-0/Tier-1 syntax.
+
+        This is a *grammar* filter only; distributional correctness (the target
+        model confirming each draft token) belongs to `generate_maya`.
+        """
+        accepted: List[int] = []
+        running_text = prefix_text
+        dummy_logits = np.zeros(max(vocab_map.keys()) + 1 if vocab_map else 1, dtype=np.float64)
+        for step_offset, tid in enumerate(draft_token_ids):
+            budget = max(1, remaining_token_budget - step_offset)
+            masked = self.apply_in_flight_mask(
+                dummy_logits,
+                running_text,
+                vocab_map,
+                remaining_token_budget=budget,
+                mode=mode,
+            )
+            if not np.isfinite(masked[tid]):
+                break
+            accepted.append(tid)
+            running_text = running_text + vocab_map.get(tid, "")
+        return accepted
 
     def verify_mtp_draft_tree(
         self,
@@ -638,6 +1016,8 @@ class Vexx35Controller:
             if parsed.has(sp.zoo, sp.oo, -sp.oo, sp.nan):
                 return "DIV_BY_ZERO"
             simplified = sp.simplify(parsed)
+            if isinstance(simplified, bool):
+                return "True" if simplified else "False"
             if simplified.has(sp.zoo, sp.oo, -sp.oo, sp.nan):
                 return "DIV_BY_ZERO"
             if simplified.is_Rational:
@@ -753,6 +1133,26 @@ class Vexx35Controller:
         entropy: float,
         proposed_val: float,
     ) -> None:
+        """Snapshot the hybrid cache *at* ``token_idx`` for exact CDCL jumpback.
+
+        A GDN recurrent state has no sequence dimension, so a bundle that carries one
+        must be snapshotted *at* that token. A pure full-attention KV bundle can be
+        sliced safely, so it may be captured later and truncated on jumpback. When
+        recurrent state is present and ``position`` disagrees with ``token_idx``, the
+        jumpback would retain future tokens, so it is rejected here instead of
+        silently corrupting causal parity.
+        """
+        if (
+            isinstance(hybrid_cache, dict)
+            and hybrid_cache.get("position") is not None
+            and _contains_recurrent_state(hybrid_cache)
+        ):
+            position = int(hybrid_cache["position"])
+            if position != int(token_idx):
+                raise ValueError(
+                    f"save_checkpoint for token {int(token_idx)} received a cache at "
+                    f"position {position}; recurrent state cannot be rewound by slicing"
+                )
         self.checkpoints.append(
             {
                 "var": var_name,
@@ -812,11 +1212,211 @@ class Vexx35Controller:
 
     trigger_farkas_cdcl_jumpback = single_row_bound_contractor
 
+    #: SI base-dimension vectors for the unit symbols Tier 4 can verify exactly.
+    _DIMENSION_BASE = {
+        "kg": {"M": 1},
+        "g": {"M": 1},
+        "m": {"L": 1},
+        "s": {"T": 1},
+        "a": {"I": 1},
+        "k": {"Theta": 1},
+        "mol": {"N": 1},
+        "cd": {"J": 1},
+        "n": {"M": 1, "L": 1, "T": -2},
+        "j": {"M": 1, "L": 2, "T": -2},
+        "w": {"M": 1, "L": 2, "T": -3},
+        "pa": {"M": 1, "L": -1, "T": -2},
+        "hz": {"T": -1},
+        "c": {"I": 1, "T": 1},
+        "v": {"M": 2, "L": 2, "T": -3, "I": -1},
+    }
+
+    @classmethod
+    def parse_unit_dimensions(cls, text: str) -> Optional[Dict[str, int]]:
+        """Dimension vector of a unit product such as ``kg*m/s^2``; None if unknown."""
+        cleaned = str(text or "").strip().lower().replace("·", "*").replace(" ", "")
+        if not cleaned:
+            return None
+        tokens = re.findall(r"[*/]|[a-z]+(?:\^[+-]?\d+)?", cleaned)
+        if not tokens or "".join(tokens) != cleaned:
+            return None
+        total: Dict[str, int] = {}
+        sign = 1
+        for token in tokens:
+            if token == "*":
+                sign = 1
+                continue
+            if token == "/":
+                sign = -1
+                continue
+            match = re.fullmatch(r"([a-z]+)(?:\^([+-]?\d+))?", token)
+            if match is None:
+                return None
+            unit = match.group(1)
+            if unit not in cls._DIMENSION_BASE:
+                return None
+            exponent = int(match.group(2) or 1)
+            for dimension, power in cls._DIMENSION_BASE[unit].items():
+                total[dimension] = total.get(dimension, 0) + sign * exponent * power
+        return {key: value for key, value in total.items() if value}
+
+    @staticmethod
+    def _normal_two_sided_p(statistic: float) -> float:
+        return math.erfc(abs(float(statistic)) / math.sqrt(2.0))
+
+    @staticmethod
+    def _chi2_survival(statistic: float, df: int) -> Optional[float]:
+        """Exact upper-tail ``P(X > x)`` for integer ``df`` via the gamma recursion."""
+        x = float(statistic)
+        if x < 0 or df <= 0:
+            return None
+        half_x = x / 2.0
+        if df % 2 == 0:
+            term = 1.0
+            total = 1.0
+            for i in range(1, df // 2):
+                term *= half_x / i
+                total += term
+            return math.exp(-half_x) * total
+        # Odd df: recurse from Q(1/2, x) = erfc(sqrt(x)) upward.
+        survival = math.erfc(math.sqrt(half_x))
+        gamma = math.sqrt(math.pi) / 2.0
+        power = math.sqrt(half_x)
+        for j in range((df - 1) // 2):
+            survival += math.exp(-half_x) * power / gamma
+            power *= half_x
+            gamma *= 1.5 + j
+        return survival
+
+    @classmethod
+    def verify_statistical_report(cls, prompt: str) -> Optional[Dict[str, str]]:
+        """Executable statistics/dimensional audit of a research claim.
+
+        Flags only arithmetically impossible statements: reported means/percentages
+        that cannot arise from integer counts at the stated ``N`` (GRIM), test
+        statistics whose reported p-value is impossible for the given ``z``, ``t``
+        or ``chi^2``, and equations whose unit dimensions disagree. Returns ``None``
+        when nothing is provably wrong, so the caller keeps its existing heuristics.
+        """
+        text = str(prompt or "")
+        lower = text.lower()
+
+        # 1. GRIM: a percentage or mean that no integer count can produce.
+        m_grim = re.search(
+            r"(\d+(?:\.\d+)?)\s*%\s*(?:of\s+)?(?:patients\s+|people\s+|participants\s+)?"
+            r"(?:n|N)\s*=\s*(\d+)",
+            text,
+        )
+        if m_grim is not None:
+            percent = float(m_grim.group(1))
+            n_total = int(m_grim.group(2))
+            if n_total > 0:
+                count = percent * n_total / 100.0
+                if abs(count - round(count)) > 1e-6:
+                    return {
+                        "type": "grim_violation",
+                        "verdict": "CONFLICT",
+                        "explanation": (
+                            f"{percent:g}% of N={n_total} implies {count:g} subjects, which is "
+                            "not an integer count (GRIM violation).\nFINAL: CONFLICT"
+                        ),
+                    }
+        m_mean = re.search(
+            r"\b(?:mean|average)\s*(?:=|of|is)\s*(\d+(?:\.\d+)?)[^.;]{0,40}?"
+            r"\b(?:n|N)\s*=\s*(\d+)",
+            text,
+        )
+        if m_mean is not None:
+            mean = float(m_mean.group(1))
+            n_total = int(m_mean.group(2))
+            if n_total > 0:
+                payload = mean * n_total
+                if abs(payload - round(payload)) > 1e-6:
+                    return {
+                        "type": "grim_violation",
+                        "verdict": "CONFLICT",
+                        "explanation": (
+                            f"mean {mean:g} over N={n_total} implies a total of {payload:g}, "
+                            "which is impossible for integer measurements (GRIM violation)."
+                            "\nFINAL: CONFLICT"
+                        ),
+                    }
+
+        # 2. Unit-dimensional homogeneity of a printed equation.
+        if "unit" in lower or "dimension" in lower:
+            m_eq = re.search(
+                r"(\d+(?:\.\d+)?)\s*([a-zA-Z][a-zA-Z0-9*/^·]*)\s*=\s*"
+                r"(\d+(?:\.\d+)?)\s*([a-zA-Z][a-zA-Z0-9*/^·]*)",
+                text,
+            )
+            if m_eq is not None:
+                lhs = cls.parse_unit_dimensions(m_eq.group(2))
+                rhs = cls.parse_unit_dimensions(m_eq.group(4))
+                if lhs is not None and rhs is not None and lhs != rhs:
+                    return {
+                        "type": "dimensional_mismatch",
+                        "verdict": "CONFLICT",
+                        "explanation": (
+                            f"{m_eq.group(2)} has dimensions {lhs} but {m_eq.group(4)} has "
+                            f"{rhs}; the equation is dimensionally inhomogeneous.\n"
+                            "FINAL: CONFLICT"
+                        ),
+                    }
+
+        # 3. Test-statistic / p-value consistency.
+        m_p = re.search(
+            r"\bp\s*=\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+\-]?\d+)?)", lower
+        )
+        if m_p is not None:
+            reported = float(m_p.group(1))
+            if 0.0 < reported <= 1.0:
+                m_z = re.search(r"\bz\s*=\s*([+\-]?\d+(?:\.\d+)?)", lower)
+                m_t = re.search(r"\bt\s*=\s*([+\-]?\d+(?:\.\d+)?)", lower)
+                m_df = re.search(r"\bdf\s*=\s*(\d+)", lower)
+                m_chi = re.search(r"(?:chi2|\u03c7\u00b2|chi-square)\s*=\s*(\d+(?:\.\d+)?)", lower)
+                expected: Optional[float] = None
+                label = ""
+                one_sided_lower_bound = False
+                if m_z is not None:
+                    expected = cls._normal_two_sided_p(float(m_z.group(1)))
+                    label = f"z={float(m_z.group(1)):g}"
+                elif m_chi is not None and m_df is not None:
+                    expected = cls._chi2_survival(float(m_chi.group(1)), int(m_df.group(1)))
+                    label = f"chi2={float(m_chi.group(1)):g}, df={int(m_df.group(1))}"
+                elif m_t is not None:
+                    t_value = abs(float(m_t.group(1)))
+                    expected = cls._normal_two_sided_p(t_value)
+                    label = f"t={t_value:g}"
+                    # Heavy t tails make the true p larger than the normal value, so
+                    # only a much smaller reported p is provably impossible.
+                    one_sided_lower_bound = bool(
+                        m_df is None or int(m_df.group(1)) < 30
+                    )
+                if expected is not None and expected > 0.0:
+                    ratio = max(expected / reported, reported / expected)
+                    too_far = ratio > 3.0 and abs(expected - reported) > 0.01
+                    if one_sided_lower_bound:
+                        too_far = reported * 10.0 < expected
+                    if too_far:
+                        return {
+                            "type": "statistical_inconsistency",
+                            "verdict": "CONFLICT",
+                            "explanation": (
+                                f"{label} implies p\u2248{expected:.4g}, but the report states "
+                                f"p={reported:g}; no df makes that pair possible.\n"
+                                "FINAL: CONFLICT"
+                            ),
+                        }
+        return None
+
     @staticmethod
     def verify_epistemic_calibration(prompt: str) -> Optional[Dict[str, str]]:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         p_lower = prompt.lower()
+        statistical = Vexx35Controller.verify_statistical_report(prompt)
+        if statistical is not None:
+            return statistical
 
         m_ci = re.search(
             r"(?P<level>(?:\d+(?:\.\d+)?))%\s*ci\s*\[\s*"
@@ -962,10 +1562,38 @@ class Vexx35Controller:
         }
 
     @classmethod
+    def _check_import_policy(cls, node: ast.AST) -> None:
+        """Allow imports only from :attr:`ALLOWED_STDLIB_MODULES` (P0.8)."""
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+            imported_names: List[str] = []
+        elif isinstance(node, ast.ImportFrom):
+            if int(node.level or 0) != 0:
+                raise PermissionError("relative imports are forbidden in the sandbox")
+            modules = [node.module or ""]
+            imported_names = [alias.name for alias in node.names]
+        else:  # pragma: no cover - defensive
+            raise PermissionError(f"unexpected import node {type(node).__name__}")
+        for name in modules:
+            root = str(name).split(".")[0]
+            if root not in cls.ALLOWED_STDLIB_MODULES:
+                raise PermissionError(f"Forbidden import: {name}")
+            if any(part.startswith("_") for part in str(name).split(".")):
+                raise PermissionError(f"Forbidden private import: {name}")
+        for name in imported_names:
+            if str(name).split(".")[0].startswith("_"):
+                raise PermissionError(f"Forbidden private import: {name}")
+        for alias in node.names:
+            if alias.asname and str(alias.asname).startswith("_"):
+                raise PermissionError(f"Forbidden private import alias: {alias.asname}")
+
+    @classmethod
     def _check_ast_policy(cls, code_str: str) -> None:
         tree = ast.parse(code_str)
         for node in ast.walk(tree):
-            if isinstance(node, cls.FORBIDDEN_AST_NODES):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                cls._check_import_policy(node)
+            elif isinstance(node, cls.FORBIDDEN_AST_NODES):
                 raise PermissionError(f"Forbidden AST node: {type(node).__name__}")
             if isinstance(node, ast.Name) and node.id in cls.FORBIDDEN_IDENTIFIERS:
                 raise PermissionError(f"Forbidden identifier: {node.id}")
@@ -1028,19 +1656,56 @@ class Vexx35Controller:
             return True, payload.get("repr"), payload.get("input_after"), None
         return False, None, None, str(payload.get("error", "execution failed"))[:300]
 
-    @classmethod
-    def execute_experiment_block(cls, script_str: str, timeout: float = 3.0) -> str:
-        """Execute a ``<experiment>...</experiment>`` block safely and return observation."""
+    def execute_experiment_block(self, script_str: str, timeout: float = 3.0) -> str:
+        """Execute one ``<experiment>`` cell with the episode's verified preamble.
+
+        Each cell still runs in a fresh sandboxed subprocess, but definitions that
+        succeeded earlier in the same episode are replayed first. A research trace
+        can therefore define a model/dataset in cell #1 and refine the hypothesis
+        in cell #2 without hitting ``NameError``.
+        """
         try:
-            cls._check_ast_policy(script_str)
+            self._check_ast_policy(script_str)
         except (SyntaxError, PermissionError) as exc:
             return f"EXP_ERROR: {exc}"
-        ok, res_repr, _after, err = cls._sandbox_dispatch(
-            script_str, timeout=timeout, mode="experiment_script"
+        combined = "\n".join([*self.experiment_preamble, script_str])
+        if self.experiment_preamble:
+            try:
+                self._check_ast_policy(combined)
+            except (SyntaxError, PermissionError) as exc:  # pragma: no cover - defensive
+                return f"EXP_ERROR: {exc}"
+        ok, res_repr, _after, err = self._sandbox_dispatch(
+            combined, timeout=timeout, mode="experiment_script"
         )
         if not ok:
             return f"EXP_ERROR: {err}"
+        self._absorb_experiment_definitions(script_str)
         return str(res_repr)
+
+    def _absorb_experiment_definitions(self, script_str: str) -> None:
+        """Carry verified definitions to later cells, excluding ``RESULT``."""
+        try:
+            tree = ast.parse(script_str)
+        except SyntaxError:  # pragma: no cover - policy check already parsed it
+            return
+        kept: List[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                kept.append(ast.unparse(node))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                kept.append(ast.unparse(node))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == "RESULT" for t in targets):
+                    continue
+                kept.append(ast.unparse(node))
+        if not kept:
+            return
+        self.experiment_preamble.extend(kept)
+        while len(self.experiment_preamble) > 64:
+            self.experiment_preamble.pop(0)
+        while sum(len(cell) for cell in self.experiment_preamble) > 24000:
+            self.experiment_preamble.pop(0)
 
     @classmethod
     def execute_capture(cls, code_str: str, fn_name: str, args: List[Any]) -> Any:
@@ -1110,7 +1775,22 @@ class Vexx35Controller:
         scored: List[Dict[str, Any]] = []
         for code in candidates:
             passed, total, errors = self.safe_execute_python(code, fn_name, test_cases)
-            scored.append({"code": code, "passed": passed, "total": total, "errors": errors})
+            try:
+                self._check_ast_policy(code)
+                syntax_ok = True
+            except (SyntaxError, PermissionError):
+                syntax_ok = False
+            scored.append(
+                {
+                    "code": code,
+                    "passed": passed,
+                    "total": total,
+                    "errors": errors,
+                    "syntax_ok": syntax_ok,
+                    "contract_ok": self._contract_ok(code, fn_name, test_cases),
+                    "mutation_free": not any("mutated its input" in e for e in errors),
+                }
+            )
         winners = [s for s in scored if s["total"] > 0 and s["passed"] == s["total"]]
         losers = [s for s in scored if s["total"] > 0 and s["passed"] < s["total"]]
         if len(winners) == 1 and losers:
@@ -1126,6 +1806,60 @@ class Vexx35Controller:
             )
         return scored
 
+    @staticmethod
+    def _contract_ok(code_str: str, fn_name: str, test_cases: List[Dict[str, Any]]) -> bool:
+        """Does ``fn_name`` exist and accept every test case's positional arity?"""
+        try:
+            tree = ast.parse(code_str)
+        except SyntaxError:
+            return False
+        node = next(
+            (
+                candidate
+                for candidate in ast.walk(tree)
+                if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and candidate.name == fn_name
+            ),
+            None,
+        )
+        if node is None:
+            return False
+        args = node.args
+        positional = list(args.posonlyargs) + list(args.args)
+        if positional and positional[0].arg in {"self", "cls"}:
+            positional = positional[1:]
+        required = max(0, len(positional) - len(args.defaults))
+        strict_max = None if args.vararg is not None else len(positional)
+        for test_case in test_cases:
+            n_args = len(test_case.get("input") or [])
+            if n_args < required:
+                return False
+            if strict_max is not None and n_args > strict_max:
+                return False
+        return True
+
+    @classmethod
+    def _execution_reward(cls, item: Dict[str, Any]) -> Tuple[float, str]:
+        """Shaped verifiable reward ladder (never a zero-variance pass/fail wall).
+
+        ``-0.5`` syntax/policy violation, ``-0.2`` contract violation or caller
+        input mutation, ``0.0`` clean run with no passing test, ``+0.3 * pass rate``
+        for a partial pass, ``+1.0`` for a full pass with zero mutation.
+        """
+        total = int(item.get("total") or 0)
+        passed = int(item.get("passed") or 0)
+        if not bool(item.get("syntax_ok", True)):
+            return -0.5, "syntax_or_policy"
+        if not bool(item.get("contract_ok", True)):
+            return -0.2, "contract_violation"
+        if not bool(item.get("mutation_free", True)):
+            return -0.2, "input_mutation"
+        if total <= 0 or passed <= 0:
+            return 0.0, "no_tests_passed"
+        if passed >= total:
+            return 1.0, "full_pass"
+        return 0.3 * (float(passed) / float(total)), "partial_pass"
+
     def compute_rlvr_group_rewards(
         self,
         candidates: List[str],
@@ -1136,10 +1870,10 @@ class Vexx35Controller:
         raw_rewards: List[float] = []
         details = self.select_verified(candidates, fn_name, test_cases)
         for item in details:
-            tot = max(1, int(item["total"]))
-            frac = float(item["passed"]) / float(tot)
-            r = 1.0 if item["passed"] == item["total"] and item["total"] > 0 else 0.2 * frac
-            raw_rewards.append(r)
+            reward, reason = self._execution_reward(item)
+            item["reward"] = reward
+            item["reward_reason"] = reason
+            raw_rewards.append(reward)
 
         arr = np.asarray(raw_rewards, dtype=np.float64)
         mean_r = float(arr.mean()) if arr.size > 0 else 0.0
@@ -1155,6 +1889,178 @@ class Vexx35Controller:
             "mean_reward": mean_r,
             "std_reward": std_r,
             "details": details,
+        }
+
+    @staticmethod
+    def _ast_max_depth(code_str: str) -> int:
+        """Structural depth of the candidate AST (MBR tie-break: prefer simpler)."""
+        try:
+            tree = ast.parse(code_str)
+        except SyntaxError:
+            return 1 << 20
+        depth = 0
+        stack: List[Tuple[ast.AST, int]] = [(tree, 1)]
+        while stack:
+            node, node_depth = stack.pop()
+            depth = max(depth, node_depth)
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, node_depth + 1))
+        return depth
+
+    def select_by_mbr(
+        self,
+        candidates: List[str],
+        fn_name: str,
+        inputs: List[List[Any]],
+        *,
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Minimum-Bayes-Risk consensus selection over executed outputs.
+
+        Tier-1 AST policy and the ``fn_name`` arity contract filter candidates
+        first, then survivors run inside the Tier-5 sandbox on the supplied
+        self-generated probe inputs. The candidate whose output tuple is shared by
+        the most survivors wins (behavioural consensus), with ties broken by the
+        shortest AST and then by the least code. ``consensus`` is only true for a
+        strict majority of at least two agreeing survivors, so a lone candidate is
+        never reported as verified. The full scoreboard is returned for audit.
+        """
+        if not inputs:
+            raise ValueError("MBR selection needs at least one probe input")
+        probes = [{"input": list(inp)} for inp in inputs]
+        scoreboard: List[Dict[str, Any]] = []
+        for index, code in enumerate(candidates):
+            try:
+                self._check_ast_policy(code)
+                policy_ok = True
+            except (SyntaxError, PermissionError):
+                policy_ok = False
+            contract_ok = policy_ok and self._contract_ok(code, fn_name, probes)
+            outputs: List[str] = []
+            mutation_free = True
+            executed = contract_ok
+            error: Optional[str] = None
+            if executed:
+                for inp in inputs:
+                    ok, res_repr, after_repr, err = self._sandbox_dispatch(
+                        code, fn_name, copy.deepcopy(inp), timeout=timeout
+                    )
+                    if not ok:
+                        executed = False
+                        error = err
+                        outputs = []
+                        break
+                    outputs.append(str(res_repr))
+                    try:
+                        after = ast.literal_eval(after_repr or "None")
+                    except (ValueError, SyntaxError):
+                        after = after_repr
+                    if after != inp:
+                        mutation_free = False
+            scoreboard.append(
+                {
+                    "index": index,
+                    "code": code,
+                    "policy_ok": policy_ok,
+                    "contract_ok": contract_ok,
+                    "executed": executed,
+                    "outputs": outputs,
+                    "mutation_free": mutation_free,
+                    "ast_depth": self._ast_max_depth(code),
+                    "error": error,
+                }
+            )
+
+        survivors = [row for row in scoreboard if row["executed"] and row["outputs"]]
+        eligible = [row for row in survivors if row["mutation_free"]] or survivors
+        counts: Dict[Tuple[str, ...], int] = {}
+        for row in eligible:
+            key = tuple(row["outputs"])
+            counts[key] = counts.get(key, 0) + 1
+        best_votes = max(counts.values()) if counts else 0
+        tied_groups = {key for key, votes in counts.items() if votes == best_votes}
+        # Vote ties are broken by the simplest AST (then the shortest code), so a
+        # 1-1 behaviour split still yields the least complex explanation.
+        pool = [row for row in eligible if tuple(row["outputs"]) in tied_groups]
+        pool.sort(key=lambda row: (row["ast_depth"], len(row["code"]), row["index"]))
+        winner = pool[0] if pool else None
+        best_outputs = tuple(winner["outputs"]) if winner is not None else ()
+        votes = counts.get(best_outputs, 0)
+        agreement = (votes / len(eligible)) if eligible else 0.0
+        return {
+            "winner": winner["code"] if winner else None,
+            "winner_index": winner["index"] if winner else None,
+            "outputs": list(best_outputs),
+            "votes": votes,
+            "survivors": len(eligible),
+            "agreement": agreement,
+            "consensus": bool(winner is not None and votes >= 2 and votes * 2 > len(eligible)),
+            "scoreboard": scoreboard,
+        }
+
+    #: Boundary probe inputs (one arg-list each) for property-based micro-fuzzing.
+    BOUNDARY_PROBES: Tuple[List[Any], ...] = (
+        [[]],
+        [[0]],
+        [[-1, -2, -1]],
+        [[3, 3, 3]],
+        [[1, 2, 3, 4, 5]],
+        [[2, 1]],
+    )
+
+    def fuzz_against_oracle(
+        self,
+        candidate: str,
+        reference: str,
+        fn_name: str,
+        inputs: Optional[List[List[Any]]] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Differential property fuzzing against a self-written naive oracle.
+
+        Both programs run in the Tier-5 sandbox on boundary probes (empty, singleton,
+        negatives, duplicates, sorted and reversed inputs) and their observed outputs
+        are compared. Disagreement, a crash on either side, or a non-literal return
+        value all count as failure: this is a property check, never a proof, and it
+        fails closed when the reference oracle itself errors.
+        """
+        probe_inputs = list(inputs) if inputs is not None else [list(p) for p in self.BOUNDARY_PROBES]
+        if not probe_inputs:
+            raise ValueError("property fuzzing needs at least one probe input")
+        mismatches: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for index, probe in enumerate(probe_inputs):
+            ok_ref, ref_repr, _ref_after, ref_err = self._sandbox_dispatch(
+                reference, fn_name, copy.deepcopy(probe), timeout=timeout
+            )
+            if not ok_ref:
+                errors.append({"input": probe, "side": "reference", "error": ref_err})
+                continue
+            ok_cand, cand_repr, _cand_after, cand_err = self._sandbox_dispatch(
+                candidate, fn_name, copy.deepcopy(probe), timeout=timeout
+            )
+            if not ok_cand:
+                errors.append({"input": probe, "side": "candidate", "error": cand_err})
+                continue
+            try:
+                expected = ast.literal_eval(ref_repr or "None")
+                actual = ast.literal_eval(cand_repr or "None")
+                agrees = actual == expected
+            except (ValueError, SyntaxError):
+                expected, actual = ref_repr, cand_repr
+                agrees = ref_repr == cand_repr
+            if not agrees:
+                mismatches.append(
+                    {"input": probe, "expected": expected, "actual": actual}
+                )
+        return {
+            "fn": fn_name,
+            "checked": len(probe_inputs),
+            "agrees": not mismatches and not errors,
+            "mismatches": mismatches,
+            "errors": errors,
+            "probes": probe_inputs,
         }
 
     def export_dpo(self, path: str) -> int:

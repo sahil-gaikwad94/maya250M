@@ -21,22 +21,26 @@ import os
 import sys
 import unittest
 
-import torch
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from maya250m import (
+if torch is not None:
+    from maya250m import (
     BPETokenizer,
     MayaModel,
     StreamPackedDataset,
     get_config,
     train_maya,
-)
-from maya250m.model import (
-    clone_hybrid_cache,
-    create_empty_hybrid_cache_v2,
-    truncate_hybrid_cache_at_token,
-)
+    )
+    from maya250m.model import (
+        clone_hybrid_cache,
+        create_empty_hybrid_cache_v2,
+        truncate_hybrid_cache_at_token,
+    )
 
 SMALL_VOCAB = 512
 
@@ -51,6 +55,7 @@ def _tiny_model(loops: int = 1, seed: int = 0) -> MayaModel:
     return MayaModel(cfg, tokenizer_hash="0" * 64)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestRecurrentParity(unittest.TestCase):
     def _assert_parity(self, loops: int, batch_size: int) -> None:
         model = _tiny_model(loops=loops, seed=11)

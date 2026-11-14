@@ -171,36 +171,105 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=180000)
     parser.add_argument("--max-wall-hours", type=float, default=None)
     parser.add_argument("--kaggle-dataset-slug", type=str, default="")
+    parser.add_argument(
+        "--smoke-test-synthetic",
+        action="store_true",
+        help=(
+            "explicitly run the 384-vocab synthetic fixture smoke test; without "
+            "this flag the flagship trainer requires a 32000-vocab tokenizer and "
+            "real train/validation shards"
+        ),
+    )
     args = parser.parse_args()
 
     hw = detect_kaggle_accelerator()
     wall_hours = args.max_wall_hours if args.max_wall_hours is not None else hw["default_wall_hours"]
-    os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    if args.tokenizer_path and os.path.exists(args.tokenizer_path):
+    # Validate data inputs before touching the filesystem or constructing a model, so
+    # an accidental flagship invocation on a non-Kaggle host exits cleanly.
+    if not args.smoke_test_synthetic:
+        # The flagship path must never silently fall back to a 384-token synthetic
+        # fixture: that produced a checkpoint whose tokenizer did not match any real
+        # corpus and quietly replaced the preset vocabulary.
+        missing = [
+            flag
+            for flag, value in (
+                ("--tokenizer-path", args.tokenizer_path),
+                ("--shard-prefix", args.shard_prefix),
+                ("--val-shard-prefix", args.val_shard_prefix),
+            )
+            if not value
+        ]
+        if missing:
+            print(
+                json.dumps(
+                    {
+                        "error": "flagship training requires explicit data inputs",
+                        "missing": missing,
+                        "hint": (
+                            "pass --tokenizer-path, --shard-prefix and "
+                            "--val-shard-prefix, or pass --smoke-test-synthetic for "
+                            "the synthetic fixture smoke test"
+                        ),
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        if not os.path.exists(args.tokenizer_path):
+            raise SystemExit(f"--tokenizer-path does not exist: {args.tokenizer_path}")
+        for label, prefix in (
+            ("train", args.shard_prefix),
+            ("validation", args.val_shard_prefix),
+        ):
+            if not os.path.exists(f"{prefix}.meta.json"):
+                raise SystemExit(f"{label} shard metadata missing: {prefix}.meta.json")
+
         tok = BPETokenizer.load(args.tokenizer_path)
+        cfg = get_config(args.preset)
+        expected_vocab = 32000
+        if int(tok.vocab_size) != expected_vocab:
+            raise SystemExit(
+                f"flagship training requires vocab_size {expected_vocab}; tokenizer "
+                f"{args.tokenizer_path} has {tok.vocab_size}"
+            )
+        if int(cfg.get("vocab", expected_vocab)) != expected_vocab:
+            raise SystemExit(
+                f"preset {args.preset} declares vocab {cfg.get('vocab')}, expected "
+                f"{expected_vocab} for flagship training"
+            )
+        cfg["vocab"] = int(tok.vocab_size)
+        tokenizer_hash = tok.tokenizer_hash()
+        for label, prefix in (
+            ("train", args.shard_prefix),
+            ("validation", args.val_shard_prefix),
+        ):
+            with open(f"{prefix}.meta.json", "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            declared = meta.get("tokenizer_hash")
+            if declared != tokenizer_hash:
+                raise SystemExit(
+                    f"{label} shard tokenizer_hash {declared!r} does not match the "
+                    f"tokenizer {tokenizer_hash!r}; refusing to train on mismatched ids"
+                )
+        model = build_maya_model(cfg, tok)
+        train_ds = MemmapShardDataset(args.shard_prefix)
+        val_ds = MemmapShardDataset(args.val_shard_prefix)
+        checkpoint_role = "flagship"
     else:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
         from run_maya250m import SYNTHETIC_RESEARCH_CORPUS
+
         train_t, val_t, _test_t, _m = deduplicate_and_split(SYNTHETIC_RESEARCH_CORPUS)
         tok = BPETokenizer.train(train_t, vocab_size=384)
         tok.save(os.path.join(args.ckpt_dir, "tokenizer.json"))
-
-    cfg = get_config(args.preset)
-    cfg["vocab"] = tok.vocab_size
-    model = build_maya_model(cfg, tok)
-
-    if args.shard_prefix and os.path.exists(f"{args.shard_prefix}.meta.json"):
-        train_ds = MemmapShardDataset(args.shard_prefix)
-        val_ds = (
-            MemmapShardDataset(args.val_shard_prefix)
-            if args.val_shard_prefix and os.path.exists(f"{args.val_shard_prefix}.meta.json")
-            else None
-        )
-    else:
-        from run_maya250m import SYNTHETIC_RESEARCH_CORPUS
-        train_t, val_t, _test_t, _m = deduplicate_and_split(SYNTHETIC_RESEARCH_CORPUS)
+        cfg = get_config(args.preset)
+        cfg["vocab"] = tok.vocab_size
+        model = build_maya_model(cfg, tok)
         train_ds = StreamPackedDataset(tok, train_t, seq_len=64)
         val_ds = StreamPackedDataset(tok, val_t, seq_len=64)
+        checkpoint_role = "smoke_test_only"
 
     last_ckpt = os.path.join(args.ckpt_dir, "maya250m_last.pt")
     best_ckpt = os.path.join(args.ckpt_dir, "maya250m_best.pt")
@@ -231,6 +300,7 @@ def main() -> int:
         tokenizer=tok,
         max_wall_hours=wall_hours,
         device=device,
+        checkpoint_role=checkpoint_role,
     )
 
     chain_status = {
@@ -244,6 +314,7 @@ def main() -> int:
         "tokens_seen": model.tokens_seen,
         "stopped_by_wall_clock": state["stopped_by_wall_clock"],
         "chain_complete": state["step"] >= args.max_steps,
+        "checkpoint_role": checkpoint_role,
     }
     with open(os.path.join(args.ckpt_dir, "chain_state.json"), "w", encoding="utf-8") as f:
         json.dump(chain_status, f, indent=2)

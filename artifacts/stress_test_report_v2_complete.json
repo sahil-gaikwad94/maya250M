@@ -1,0 +1,197 @@
+{
+  "unittest_suite": {
+    "total_discovered": 358,
+    "executed_on_cpu": 353,
+    "passed": 353,
+    "skipped_torch_only": 5,
+    "failures": 0,
+    "errors": 0,
+    "pass_rate_of_executed_pct": 100.0
+  },
+  "domain_batteries_verified": {
+    "coding": {
+      "tasks": 6,
+      "pass_at_1": 1.0
+    },
+    "maths": {
+      "tasks": 6,
+      "pass_at_1": 1.0
+    },
+    "reasoning": {
+      "tasks": 4,
+      "pass_at_1": 1.0
+    },
+    "research": {
+      "tasks": 4,
+      "pass_at_1": 1.0
+    },
+    "neural": {
+      "tasks": 6,
+      "pass_at_1": 0.0
+    }
+  },
+  "repo_ordering_ablation": {
+    "baseline": "ppr_only",
+    "n_queries": 4,
+    "gdn_claim": "hypothesis",
+    "decision": "INCONCLUSIVE",
+    "decision_reason": "only 4 queries (< 20); report values but do not adopt a verdict",
+    "conditions": [
+      {
+        "name": "random",
+        "description": "seeded random file order",
+        "uses_dependency_order": false,
+        "uses_neural_reranker": false,
+        "compute_units": 1.0,
+        "implemented": true,
+        "recall_at_1": 0.25,
+        "recall_at_5": 1.0,
+        "mrr": 0.5208333333333334,
+        "cross_file_recall_at_5": 0.5,
+        "mean_rank": 2.5,
+        "unresolved": 0,
+        "token_cost": 112.0,
+        "latency_ms": 0.011769487173296511,
+        "measured": true
+      },
+      {
+        "name": "topological",
+        "description": "import/topological order",
+        "uses_dependency_order": true,
+        "uses_neural_reranker": false,
+        "compute_units": 1.2,
+        "implemented": true,
+        "recall_at_1": 0.25,
+        "recall_at_5": 1.0,
+        "mrr": 0.5208333333333334,
+        "cross_file_recall_at_5": 0.5,
+        "mean_rank": 2.5,
+        "unresolved": 0,
+        "token_cost": 112.0,
+        "latency_ms": 0.010863004717975855,
+        "measured": true
+      },
+      {
+        "name": "ppr_only",
+        "description": "PPR repo map only",
+        "uses_dependency_order": false,
+        "uses_neural_reranker": false,
+        "compute_units": 1.4,
+        "implemented": true,
+        "recall_at_1": 0.25,
+        "recall_at_5": 1.0,
+        "mrr": 0.5208333333333334,
+        "cross_file_recall_at_5": 0.5,
+        "mean_rank": 2.5,
+        "unresolved": 0,
+        "token_cost": 112.0,
+        "latency_ms": 0.19712976063601673,
+        "measured": true
+      },
+      {
+        "name": "ppr_dependency",
+        "description": "PPR plus dependency closure boost",
+        "uses_dependency_order": true,
+        "uses_neural_reranker": false,
+        "compute_units": 1.7,
+        "implemented": true,
+        "recall_at_1": 0.25,
+        "recall_at_5": 1.0,
+        "mrr": 0.5208333333333334,
+        "cross_file_recall_at_5": 0.5,
+        "mean_rank": 2.5,
+        "unresolved": 0,
+        "token_cost": 112.0,
+        "latency_ms": 0.16485428204759955,
+        "measured": true
+      },
+      {
+        "name": "hybrid_lexical",
+        "description": "PPR plus lexical symbol overlap",
+        "uses_dependency_order": false,
+        "uses_neural_reranker": false,
+        "compute_units": 1.9,
+        "implemented": true,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "cross_file_recall_at_5": 0.5,
+        "mean_rank": 1.0,
+        "unresolved": 0,
+        "token_cost": 112.0,
+        "latency_ms": 0.16372502432204783,
+        "measured": true
+      }
+    ]
+  },
+  "deep_stress_cases": {
+    "passed": 15,
+    "total": 16,
+    "cases": [
+      [
+        "C1_dag_topological_sort_and_cycle_guard",
+        true
+      ],
+      [
+        "C2_space_optimized_levenshtein_dp",
+        true
+      ],
+      [
+        "C3_fenwick_tree_range_queries",
+        true
+      ],
+      [
+        "C4_input_mutation_rejected_by_rlvr",
+        false
+      ],
+      [
+        "M1_exact_nested_rational_cas",
+        true
+      ],
+      [
+        "M2_symbolic_cubic_cancellation",
+        true
+      ],
+      [
+        "M3_symbolic_definite_integral",
+        true
+      ],
+      [
+        "M4_mersenne_modular_pow",
+        true
+      ],
+      [
+        "M5_linear_system_3x3_exact",
+        true
+      ],
+      [
+        "M6_cdcl_bound_contractor_and_v2_rewind",
+        true
+      ],
+      [
+        "R1_euler_counterexample_discovery",
+        true
+      ],
+      [
+        "R2_statistical_claim_and_conflict_calibration",
+        true
+      ],
+      [
+        "R3_repeating_vs_finite_decimal_distinction",
+        true
+      ],
+      [
+        "N1_negative_eigenvalue_parity_64_steps",
+        true
+      ],
+      [
+        "N2_wy_chunk_parallel_gdn_doc_boundary_parity",
+        true
+      ],
+      [
+        "N3_unit_jacobian_loop_injection_alive_at_init",
+        true
+      ]
+    ]
+  }
+}

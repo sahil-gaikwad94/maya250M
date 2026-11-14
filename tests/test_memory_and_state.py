@@ -44,7 +44,7 @@ from maya250m.reasoning import (
 )
 from maya250m.understanding import (
     TaskSpec,
-    constraint_coverage,
+    lexical_requirement_coverage,
     parse_task_spec,
     validate_task_spec,
 )
@@ -81,11 +81,11 @@ class TestTaskSpec(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_task_spec("   ")
 
-    def test_constraint_coverage_detects_missing_constraints(self):
+    def test_lexical_requirement_coverage_detects_missing_constraints(self):
         spec = parse_task_spec(
             "Fix the bug. You must preserve the public API and must not add new dependencies."
         )
-        coverage = constraint_coverage(spec, "The public API is preserved; tests pass.")
+        coverage = lexical_requirement_coverage(spec, "The public API is preserved; tests pass.")
         self.assertEqual(len(coverage), len(spec.constraints))
         self.assertTrue(any(coverage.values()))
         self.assertTrue(any(not v for v in coverage.values()))

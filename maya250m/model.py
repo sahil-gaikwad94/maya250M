@@ -19,8 +19,13 @@ Key architectural innovations and upgrades:
 3.  **Prelude-Recurrent-Core-Coda Latent Reasoning Architecture**:
     Partitions the 32 physical layers into Prelude (8L), Recurrent Core (16L),
     and Coda (8L). Iterating the Recurrent Core ``num_loops`` times in continuous
-    latent space (Geiping et al., NeurIPS 2025) yields 48 to 80 effective layers
-    of reasoning depth without increasing parameter count or KV cache.
+    latent space (Geiping et al., NeurIPS 2025) yields 48 to 80 effective layers of
+    reasoning depth at **exactly constant parameter count**, but it is not free at
+    inference time: every recurrent core pass keeps its own cache entries for Tier-3
+    rewinds. Each additional core pass adds ``+128 MiB`` BF16 full-attention KV and
+    ``+4.82 MiB`` FP32 GDN recurrent state at 32K context (``268,435,456 B`` at
+    ``R=1``, ``402,653,184 B`` at ``R=2``, ``671,088,640 B`` at ``R=4``), matching
+    ``metrics_maya250m.json`` and the README table.
 4.  **Sequential Weight-Tied MTP (Depth 1-3) + Speculative Draft Proposal + LayerSkip**:
     Trains with up to 3 causal future-token horizons and shared-unembedding
     intermediate-layer supervision, and exposes ``propose_mtp_drafts()`` for
