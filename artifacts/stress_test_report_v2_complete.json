@@ -1,9 +1,9 @@
 {
   "unittest_suite": {
     "total_discovered": 358,
-    "executed_on_cpu": 358,
-    "passed": 358,
-    "skipped_torch_only": 0,
+    "executed_on_cpu": 353,
+    "passed": 353,
+    "skipped_torch_only": 5,
     "failures": 0,
     "errors": 0,
     "pass_rate_of_executed_pct": 100.0
@@ -51,7 +51,7 @@
         "mean_rank": 2.5,
         "unresolved": 0,
         "token_cost": 112.0,
-        "latency_ms": 0.02133475209120661,
+        "latency_ms": 0.011769487173296511,
         "measured": true
       },
       {
@@ -68,7 +68,7 @@
         "mean_rank": 2.5,
         "unresolved": 0,
         "token_cost": 112.0,
-        "latency_ms": 0.038033758755773306,
+        "latency_ms": 0.010863004717975855,
         "measured": true
       },
       {
@@ -85,7 +85,7 @@
         "mean_rank": 2.5,
         "unresolved": 0,
         "token_cost": 112.0,
-        "latency_ms": 0.378139506210573,
+        "latency_ms": 0.19712976063601673,
         "measured": true
       },
       {
@@ -102,7 +102,7 @@
         "mean_rank": 2.5,
         "unresolved": 0,
         "token_cost": 112.0,
-        "latency_ms": 0.28767201001755893,
+        "latency_ms": 0.16485428204759955,
         "measured": true
       },
       {
@@ -119,7 +119,7 @@
         "mean_rank": 1.0,
         "unresolved": 0,
         "token_cost": 112.0,
-        "latency_ms": 0.30716850596945733,
+        "latency_ms": 0.16372502432204783,
         "measured": true
       }
     ]
