@@ -34,6 +34,7 @@ __all__ = [
     "rank_files",
     "build_queries",
     "run_ordering_ablation",
+    "decide_ordering",
     "AblationReport",
 ]
 
@@ -292,6 +293,77 @@ def _mean(values: Iterable[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def decide_ordering(
+    per_condition: Dict[str, Dict[str, Any]], baseline: str
+) -> Tuple[str, str]:
+    """Choose an ordering condition from measured metrics under a compute budget.
+
+    Every measured condition is evaluated, not just one hardcoded candidate, and the
+    decision is not recall@5-only: once recall@5 saturates at 1.000, MRR and Recall@1
+    are the remaining signal. A condition is adoptable when it improves recall@5
+    without regressing cross-file recall, or improves MRR by at least 0.05 without
+    regressing recall@5 or cross-file recall, inside the ``1.5x`` compute envelope.
+    The highest-MRR adoptable condition wins.
+    """
+    baseline_entry = per_condition.get(baseline)
+    if baseline_entry is None:
+        return "INCONCLUSIVE", f"baseline {baseline!r} was not run"
+    if not baseline_entry.get("measured"):
+        return "INCONCLUSIVE", f"baseline {baseline!r} was not measured"
+
+    baseline_recall = float(baseline_entry["recall_at_5"])
+    baseline_mrr = float(baseline_entry["mrr"])
+    baseline_cross = float(baseline_entry["cross_file_recall_at_5"])
+    compute_envelope = float(baseline_entry["compute_units"]) * 1.5
+
+    adoptable: List[Dict[str, Any]] = []
+    rejected: List[str] = []
+    for name, entry in per_condition.items():
+        if name == baseline or not entry.get("measured"):
+            continue
+        if float(entry["compute_units"]) > compute_envelope + 1e-9:
+            rejected.append(
+                f"{name} ({entry['compute_units']:.1f}x > {compute_envelope:.1f}x compute)"
+            )
+            continue
+        recall = float(entry["recall_at_5"])
+        mrr = float(entry["mrr"])
+        cross = float(entry["cross_file_recall_at_5"])
+        better_recall = recall > baseline_recall + 1e-9 and cross >= baseline_cross - 1e-9
+        better_mrr = (
+            mrr >= baseline_mrr + 0.05 - 1e-9
+            and recall >= baseline_recall - 1e-9
+            and cross >= baseline_cross - 1e-9
+        )
+        if better_recall or better_mrr:
+            adoptable.append(entry)
+
+    if not adoptable:
+        return (
+            "RETAIN_BASELINE",
+            f"no measured condition improved MRR by >= 0.05 or recall@5 over "
+            f"{baseline} (MRR {baseline_mrr:.4f}, recall@5 {baseline_recall:.3f})"
+            + (f"; rejected: {'; '.join(rejected)}" if rejected else ""),
+        )
+
+    best = max(
+        adoptable,
+        key=lambda entry: (
+            float(entry["mrr"]),
+            float(entry["recall_at_5"]),
+            float(entry["recall_at_1"]),
+            -float(entry["compute_units"]),
+        ),
+    )
+    return (
+        f"ADOPT_{str(best['name']).upper()}",
+        f"{best['name']} achieves MRR {best['mrr']:.4f} and recall@5 "
+        f"{best['recall_at_5']:.3f} (baseline {baseline}: MRR {baseline_mrr:.4f}, "
+        f"recall@5 {baseline_recall:.3f}, cross-file {baseline_cross:.3f}) at "
+        f"{best['compute_units']:.1f}x compute within the 1.5x envelope",
+    )
+
+
 def run_ordering_ablation(
     indexer: RepoGraphIndexer,
     queries: Optional[Sequence[LocalizationQuery]] = None,
@@ -375,22 +447,7 @@ def run_ordering_ablation(
         )
         return report
 
-    candidate = per_condition.get("ppr_dependency")
-    if candidate is None:
-        report.decision_reason = "dependency condition was not run"
-        return report
-    improved = candidate["recall_at_5"] > baseline_entry["recall_at_5"] + 1e-9
-    not_more_compute = candidate["compute_units"] <= baseline_entry["compute_units"] * 1.5
-    if improved and not_more_compute:
-        report.decision = "KEEP_DEPENDENCY_ORDERING"
-        report.decision_reason = (
-            f"recall@5 {candidate['recall_at_5']:.3f} > {baseline_entry['recall_at_5']:.3f} "
-            f"at {candidate['compute_units']:.1f}x vs {baseline_entry['compute_units']:.1f}x compute"
-        )
-    else:
-        report.decision = "RETAIN_BASELINE"
-        report.decision_reason = (
-            f"recall@5 {candidate['recall_at_5']:.3f} vs {baseline_entry['recall_at_5']:.3f}; "
-            f"compute {candidate['compute_units']:.1f}x vs {baseline_entry['compute_units']:.1f}x"
-        )
+    report.decision, report.decision_reason = decide_ordering(
+        per_condition, report.baseline
+    )
     return report

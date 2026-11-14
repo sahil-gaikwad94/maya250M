@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  cpu-only:
+    name: CPU-only import gate and test suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Deliberately no PyTorch: this job proves the suite imports and runs on
+      # CPU-only shards, with tensor tests skipped rather than crashing collection.
+      - name: Install CPU dependencies
+        run: python -m pip install --upgrade pip numpy sympy scipy pytest
+      - name: Compile and collect
+        run: python tools/ci_check.py
+      - name: Run CPU suite
+        run: python -m pytest tests/ -q
+
+  with-torch:
+    name: Full suite with CPU PyTorch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy sympy scipy pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Compile, collect and run
+        run: python tools/ci_check.py --run

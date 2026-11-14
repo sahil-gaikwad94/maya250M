@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from maya250m.config import get_config
 from maya250m.evaluation import (
     ABLATIONS,
+    decide_ordering,
     EvalReport,
     EvalTask,
     Measurement,
@@ -19,7 +20,7 @@ from maya250m.evaluation import (
     MeasurementStatus,
     ablation_table,
     apply_ablation,
-    constraint_verifier,
+    lexical_constraint_verifier,
     contains_all_verifier,
     exact_match_verifier,
     pass_at_k,
@@ -118,9 +119,9 @@ class TestHarness(unittest.TestCase):
         with self.assertRaises(ValueError):
             pass_at_k(2, 3, 1)
 
-    def test_constraint_verifier_uses_parsed_spec(self):
+    def test_lexical_constraint_verifier_uses_parsed_spec(self):
         spec = parse_task_spec("Write a function that must not add new dependencies.")
-        verifier = constraint_verifier(spec)
+        verifier = lexical_constraint_verifier(spec)
         # constraint_coverage is a documented lexical *addressing* audit.
         self.assertTrue(verifier("# no new dependencies added\ndef f(): return 1").passed)
         self.assertFalse(verifier("def f(): return 1").passed)
@@ -194,6 +195,58 @@ class TestAblationMatrix(unittest.TestCase):
         self.assertEqual(result.status, MeasurementStatus.FAILED)
         self.assertIn("OOM", result.reason)
         self.assertIsNone(result.to_measurement().value)
+
+
+class TestOrderingDecision(unittest.TestCase):
+    """P0.11: the gate evaluates every condition and uses MRR, not recall@5 only."""
+
+    @staticmethod
+    def _entry(name, recall_at_5, mrr, recall_at_1, cross=1.0, compute=1.0):
+        return {
+            "name": name,
+            "measured": True,
+            "recall_at_1": recall_at_1,
+            "recall_at_5": recall_at_5,
+            "mrr": mrr,
+            "cross_file_recall_at_5": cross,
+            "compute_units": compute,
+        }
+
+    def test_saturated_recall_adopts_the_higher_mrr_condition(self):
+        per_condition = {
+            "ppr_dependency": self._entry("ppr_dependency", 1.0, 0.35, 0.0),
+            "hybrid_lexical": self._entry("hybrid_lexical", 1.0, 0.75, 0.5, compute=1.1),
+        }
+        decision, reason = decide_ordering(per_condition, "ppr_dependency")
+        self.assertEqual(decision, "ADOPT_HYBRID_LEXICAL")
+        self.assertIn("0.7500", reason)
+
+    def test_no_improvement_retains_the_baseline(self):
+        per_condition = {
+            "ppr_dependency": self._entry("ppr_dependency", 1.0, 0.35, 0.0),
+            "ppr_only": self._entry("ppr_only", 1.0, 0.35, 0.0, compute=0.9),
+        }
+        decision, _reason = decide_ordering(per_condition, "ppr_dependency")
+        self.assertEqual(decision, "RETAIN_BASELINE")
+
+    def test_condition_outside_the_compute_envelope_is_rejected(self):
+        per_condition = {
+            "ppr_dependency": self._entry("ppr_dependency", 0.5, 0.3, 0.2),
+            "hybrid_neural_rerank": self._entry(
+                "hybrid_neural_rerank", 0.9, 0.8, 0.8, compute=4.0
+            ),
+        }
+        decision, reason = decide_ordering(per_condition, "ppr_dependency")
+        self.assertEqual(decision, "RETAIN_BASELINE")
+        self.assertIn("rejected", reason)
+
+    def test_cross_file_recall_regression_blocks_adoption(self):
+        per_condition = {
+            "ppr_dependency": self._entry("ppr_dependency", 0.8, 0.4, 0.3, cross=0.9),
+            "hybrid_lexical": self._entry("hybrid_lexical", 0.95, 0.7, 0.6, cross=0.4),
+        }
+        decision, _reason = decide_ordering(per_condition, "ppr_dependency")
+        self.assertEqual(decision, "RETAIN_BASELINE")
 
 
 if __name__ == "__main__":

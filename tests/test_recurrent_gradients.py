@@ -14,19 +14,27 @@ import os
 import sys
 import unittest
 
-import torch
-import torch.nn.functional as F
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
+
+if torch is not None:
+    import torch.nn.functional as F
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from maya250m.config import get_config
-from maya250m.model import MayaModel, rms_norm_fp32
+
+if torch is not None:
+    from maya250m.model import MayaModel, rms_norm_fp32
 
 SMALL_VOCAB = 512
 
 
-def _tiny_model(loops: int = 2, seed: int = 0, dtype: torch.dtype = torch.float32) -> MayaModel:
+def _tiny_model(loops: int = 2, seed: int = 0, dtype=None):
     torch.manual_seed(seed)
+    dtype = torch.float32 if dtype is None else dtype
     cfg = get_config("MAYA_TINY_TEST")
     cfg["recurrent_loops"] = int(loops)
     cfg["vocab"] = SMALL_VOCAB
@@ -40,6 +48,7 @@ def _ids(seq_len: int = 12, batch: int = 1, vocab: int = SMALL_VOCAB) -> torch.T
     return torch.randint(0, vocab, (batch, seq_len), generator=generator)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestNormSemantics(unittest.TestCase):
     def test_zero_centered_weight_is_identity(self):
         torch.manual_seed(0)
@@ -63,6 +72,7 @@ class TestNormSemantics(unittest.TestCase):
         )
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestRecurrentPathIsAlive(unittest.TestCase):
     def test_zero_gate_still_produces_loop_output(self):
         """At init the gate is zero, but loop 1 must differ from the prelude output."""
@@ -118,6 +128,7 @@ class TestRecurrentPathIsAlive(unittest.TestCase):
         self.assertGreater(float((perturbed - base).abs().max()), 1e-6)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestForwardPrefillDecodeParity(unittest.TestCase):
     """forward() == prefill + token-by-token decode() for R = 1..4, with numbers."""
 
@@ -183,6 +194,7 @@ class TestForwardPrefillDecodeParity(unittest.TestCase):
         self.assertLess(float((prefill_logits - full_logits[:, -1, :]).abs().max()), 1e-4)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestMixedPrecision(unittest.TestCase):
     def test_bfloat16_parity_within_dtype_tolerance(self):
         torch.manual_seed(0)

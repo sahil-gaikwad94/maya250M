@@ -9,33 +9,37 @@ import sys
 import tempfile
 import unittest
 
-import torch
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from maya250m.config import get_config
-from maya250m.model import MayaModel
-from maya250m.tokenizer import BPETokenizer
-from maya250m.training import (
-    PreferencePair,
-    RolloutGroup,
-    StageConfig,
-    StagePlan,
-    StageResult,
-    TrainingDidNotUpdate,
-    count_changed_parameters,
-    dpo_loss,
-    frozen_reference,
-    grpo_objective,
-    run_distillation_stage,
-    run_dpo_stage,
-    run_grpo_stage,
-    run_sft_stage,
-    run_stage_plan,
-    snapshot_parameters,
-    tokenize_prompt_completion,
-    tokenize_sft_text,
-)
+if torch is not None:
+    from maya250m.config import get_config
+    from maya250m.model import MayaModel
+    from maya250m.tokenizer import BPETokenizer
+    from maya250m.training import (
+        PreferencePair,
+        RolloutGroup,
+        StageConfig,
+        StagePlan,
+        StageResult,
+        TrainingDidNotUpdate,
+        count_changed_parameters,
+        dpo_loss,
+        frozen_reference,
+        grpo_objective,
+        run_distillation_stage,
+        run_dpo_stage,
+        run_grpo_stage,
+        run_sft_stage,
+        run_stage_plan,
+        snapshot_parameters,
+        tokenize_prompt_completion,
+        tokenize_sft_text,
+    )
 
 PROMPT = "# Write a Python function `add` that returns a + b.\n"
 CHOSEN = "def add(a, b):\n    return a + b\n"
@@ -51,6 +55,7 @@ def _tiny_model(tokenizer: BPETokenizer, seed: int = 0) -> MayaModel:
     return MayaModel(cfg, tokenizer_hash=tokenizer.tokenizer_hash())
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestTokenization(unittest.TestCase):
     def test_prompt_is_masked_and_completion_eos_scored(self):
         tok = BPETokenizer()
@@ -70,6 +75,7 @@ class TestTokenization(unittest.TestCase):
         self.assertEqual(before.input_ids, after.input_ids)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestLossMath(unittest.TestCase):
     def test_dpo_is_ln2_at_reference(self):
         policy_c = torch.tensor([-1.0], requires_grad=True)
@@ -126,6 +132,7 @@ class TestLossMath(unittest.TestCase):
         self.assertEqual(float(policy_lp.grad.abs().sum()), 0.0)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TrainingFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -146,6 +153,7 @@ class TrainingFixture(unittest.TestCase):
         ]
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestSFTStage(TrainingFixture):
     def test_sft_updates_parameters(self):
         model = self._model()
@@ -169,6 +177,7 @@ class TestSFTStage(TrainingFixture):
             run_sft_stage(model, [], cfg)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestDistillationStage(TrainingFixture):
     @staticmethod
     def _kl(student, teacher, example) -> float:
@@ -223,6 +232,7 @@ class TestDistillationStage(TrainingFixture):
             run_distillation_stage(model, model, self._sft_examples(), StageConfig(steps=1))
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestDPOStage(TrainingFixture):
     def test_dpo_stage_optimises_margin(self):
         model = self._model(seed=5)
@@ -261,6 +271,7 @@ class TestDPOStage(TrainingFixture):
             run_dpo_stage(model, frozen_reference(model), [], self.tokenizer, StageConfig(steps=1))
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestGRPOStage(TrainingFixture):
     def _groups(self):
         return [
@@ -305,6 +316,7 @@ class TestGRPOStage(TrainingFixture):
         self.assertEqual(count_changed_parameters(model, before), 0)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestStagePlan(TrainingFixture):
     def test_plan_records_and_fails_closed(self):
         model = self._model(seed=11)

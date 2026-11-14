@@ -6,11 +6,15 @@ import os
 import sys
 import unittest
 
-import torch
+try:  # PyTorch is optional on CPU-only shards; tensor tests are skipped without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised on torch-free nodes
+    torch = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from maya250m.cache import (
+if torch is not None:
+    from maya250m.cache import (
     CACHE_SCHEMA_VERSION,
     CacheIdentityError,
     CacheRewindError,
@@ -21,9 +25,9 @@ from maya250m.cache import (
     rewind_cache,
     stamp_bundle,
     validate_bundle,
-)
-from maya250m.config import get_config
-from maya250m.model import MayaModel, create_empty_hybrid_cache_v3
+    )
+    from maya250m.config import get_config
+    from maya250m.model import MayaModel, create_empty_hybrid_cache_v3
 
 SMALL_VOCAB = 512
 
@@ -44,6 +48,7 @@ def _ids(seq_len: int = 12, seed: int = 7) -> torch.Tensor:
     return torch.randint(0, SMALL_VOCAB, (1, seq_len), generator=generator)
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestCacheIdentity(unittest.TestCase):
     def test_prefill_stamps_schema3_metadata(self):
         model = _tiny_model()
@@ -122,6 +127,7 @@ class TestCacheIdentity(unittest.TestCase):
         self.assertIs(stamped["prelude"], bundle["prelude"])
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestRewind(unittest.TestCase):
     def _setup(self):
         model = _tiny_model(loops=2, seed=3).eval()
@@ -226,6 +232,7 @@ class TestRewind(unittest.TestCase):
                         )
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class TestMemoryLedger(unittest.TestCase):
     def test_ledger_scales_with_loops_and_context(self):
         model = _tiny_model(loops=2)

@@ -12,6 +12,7 @@ The runtime is the only place allowed to execute a tool. It enforces:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -34,7 +35,20 @@ from .trajectories import (
     score_trajectory,
 )
 
-__all__ = ["ToolObservation", "AgentRuntime", "LOOP_GUARD_TEMPLATE"]
+__all__ = [
+    "ToolObservation",
+    "AgentRuntime",
+    "ConstraintEvidence",
+    "CompletionEvidence",
+    "LOOP_GUARD_TEMPLATE",
+]
+
+REQUIREMENT_STATUSES = ("unknown", "addressed", "verified", "failed", "unverified")
+EVIDENCE_KINDS = ("test", "typecheck", "contract", "diff", "manual_review")
+
+_CODE_TASK_TYPES = frozenset(
+    {"bug_fix", "code_edit", "code_generation", "refactor", "test_writing"}
+)
 
 LOOP_GUARD_TEMPLATE = (
     "[LOOP_GUARD: You already executed this exact query at step {step}; "
@@ -60,6 +74,71 @@ _PHASE_AFTER_TOOL = {
     "apply_patch": PHASE_VERIFY,
     "git_revert_file": PHASE_HYPOTHESIZE,
 }
+
+
+@dataclass
+class ConstraintEvidence:
+    """What is actually known about one requirement, and the evidence proving it.
+
+    ``status`` is one of :data:`REQUIREMENT_STATUSES`. Only ``verified`` may satisfy
+    a mandatory requirement; lexical matches are at best ``addressed``.
+    """
+
+    constraint_id: str
+    status: str = "unknown"
+    evidence_kind: str = "manual_review"
+    evidence_ids: List[str] = field(default_factory=list)
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in REQUIREMENT_STATUSES:
+            raise ValueError(f"unknown requirement status {self.status!r}")
+        if self.evidence_kind not in EVIDENCE_KINDS:
+            raise ValueError(f"unknown evidence kind {self.evidence_kind!r}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "constraint_id": self.constraint_id,
+            "status": self.status,
+            "evidence_kind": self.evidence_kind,
+            "evidence_ids": list(self.evidence_ids),
+            "note": self.note,
+        }
+
+
+@dataclass
+class CompletionEvidence:
+    """Structured completion proof supplied to :meth:`AgentRuntime.finalize`.
+
+    A caller-supplied boolean cannot satisfy this contract: the patch candidate, the
+    final diff hash, the post-patch test runs and the per-requirement evidence are
+    all checked against the runtime's own ledger before an episode can resolve.
+    """
+
+    patch_applied: bool
+    targeted_tests_passed: bool
+    regression_tests_passed: bool
+    static_checks_passed: Optional[bool]
+    required_constraints_verified: List[str] = field(default_factory=list)
+    unresolved_constraints: List[str] = field(default_factory=list)
+    final_diff_sha256: Optional[str] = None
+    test_run_ids: List[str] = field(default_factory=list)
+    #: Requirements the user explicitly accepted as out of scope. Recorded, never
+    #: silently inferred; a waiver cannot be manufactured by the agent itself.
+    waived_constraints: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "patch_applied": bool(self.patch_applied),
+            "targeted_tests_passed": bool(self.targeted_tests_passed),
+            "regression_tests_passed": bool(self.regression_tests_passed),
+            "static_checks_passed": self.static_checks_passed,
+            "required_constraints_verified": list(self.required_constraints_verified),
+            "unresolved_constraints": list(self.unresolved_constraints),
+            "final_diff_sha256": self.final_diff_sha256,
+            "test_run_ids": list(self.test_run_ids),
+            "waived_constraints": list(self.waived_constraints),
+        }
 
 
 @dataclass
@@ -116,6 +195,11 @@ class AgentRuntime:
         self._edit_generation = 0
         self._current_step = 0
         self.last_patch_text: Optional[str] = None
+        self.requirement_evidence: Dict[str, ConstraintEvidence] = {}
+        self.requirement_test_map: Dict[str, List[str]] = {}
+        self.mandatory_requirements: Dict[str, bool] = {}
+        self.requirement_verifiers: Dict[str, List[str]] = {}
+        self._test_runs: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ helpers
 
@@ -212,8 +296,12 @@ class AgentRuntime:
 
         verification: Optional[VerificationResult] = None
         status = "ok"
+        tool_kwargs = dict(kwargs)
+        if tool_name == "run_tests":
+            # ``requirement_ids`` is runtime bookkeeping, not a RepoTools argument.
+            tool_kwargs.pop("requirement_ids", None)
         try:
-            result = self.tools.call(tool_name, **kwargs)
+            result = self.tools.call(tool_name, **tool_kwargs)
         except ToolCallError as exc:
             verification = failure("invalid_tool_call", str(exc))
             result = None
@@ -262,11 +350,161 @@ class AgentRuntime:
         if verification is None or verification.passed:
             self._maybe_advance(tool_name)
 
-        if tool_name == "run_tests" and verification is not None and verification.passed:
-            self.state.record_constraint_coverage(
-                {k: True for k in self.state.constraint_status}
-            )
+        if tool_name == "run_tests":
+            self.record_test_run(kwargs, verification)
         return observation
+
+    # ------------------------------------------------------ requirement ledger
+
+    def register_requirement(
+        self,
+        text: str,
+        requirement_id: Optional[str] = None,
+        mandatory: bool = True,
+        test_ids: Sequence[str] = (),
+        verifier_ids: Sequence[str] = (),
+    ) -> str:
+        """Register one requirement with a stable id and its verifier declarations."""
+        if requirement_id is None:
+            requirement_id = f"constraint_{len(self.state.constraints)}"
+            self.state.constraints.append(text)
+        elif text:
+            self.state.pin_fact(f"requirement {requirement_id}: {text}")
+        self.state.constraint_status.setdefault(requirement_id, False)
+        self.mandatory_requirements[requirement_id] = bool(mandatory)
+        self.requirement_evidence.setdefault(
+            requirement_id, ConstraintEvidence(constraint_id=requirement_id)
+        )
+        if test_ids:
+            self.bind_requirement_tests(requirement_id, test_ids)
+        if verifier_ids:
+            self.requirement_verifiers[requirement_id] = [str(v) for v in verifier_ids]
+        elif text:
+            from ..requirement_evidence import requirement_verifiers_for_text
+
+            self.requirement_verifiers[requirement_id] = requirement_verifiers_for_text(text)
+        return requirement_id
+
+    def bind_requirement_tests(
+        self, requirement_id: str, test_ids: Sequence[str]
+    ) -> None:
+        """Declare exactly which test targets verify ``requirement_id``."""
+        mapping = self.requirement_test_map.setdefault(requirement_id, [])
+        for test_id in test_ids:
+            cleaned = str(test_id).strip()
+            if cleaned and cleaned not in mapping:
+                mapping.append(cleaned)
+
+    def record_requirement_evidence(
+        self,
+        constraint_id: str,
+        status: str,
+        evidence_kind: str = "manual_review",
+        evidence_ids: Sequence[str] = (),
+        note: str = "",
+    ) -> ConstraintEvidence:
+        """Record what a verifier proved about one requirement.
+
+        Nothing here is inferred from an unrelated passing command; callers pass the
+        exact requirement ids a verifier covers.
+        """
+        evidence = ConstraintEvidence(
+            constraint_id=constraint_id,
+            status=status,
+            evidence_kind=evidence_kind,
+            evidence_ids=list(evidence_ids),
+            note=note,
+        )
+        self.requirement_evidence[constraint_id] = evidence
+        self.state.constraint_status[constraint_id] = status == "verified"
+        return evidence
+
+    def _requirements_for_target(self, test_target: str) -> List[str]:
+        """Requirements whose declared test ids match ``test_target``.
+
+        An empty target runs the whole suite, which does not *prove* that any
+        particular requirement's test executed, so it maps to nothing.
+        """
+        target = str(test_target or "").strip().replace("\\", "/")
+        if not target:
+            return []
+        matched: List[str] = []
+        for requirement_id, test_ids in self.requirement_test_map.items():
+            for test_id in test_ids:
+                declared = str(test_id).replace("\\", "/")
+                if target == declared or target.endswith(declared) or declared.endswith(target):
+                    matched.append(requirement_id)
+                    break
+        return matched
+
+    def record_test_run(
+        self, kwargs: Dict[str, Any], verification: Optional[VerificationResult]
+    ) -> str:
+        """Log one test command and update only the requirements it covers."""
+        target = str(kwargs.get("test_target") or "")
+        passed = bool(verification is not None and verification.passed)
+        run_id = f"test_run_{len(self._test_runs) + 1}"
+        requirement_ids = list(kwargs.get("requirement_ids") or ())
+        if not requirement_ids:
+            requirement_ids = self._requirements_for_target(target)
+        self._test_runs.append(
+            {
+                "id": run_id,
+                "target": target,
+                "passed": passed,
+                "step": int(self._current_step),
+                "edit_generation": int(self._edit_generation),
+                "requirement_ids": requirement_ids,
+                "failure_category": (
+                    verification.failure_category
+                    if verification is not None and not passed
+                    else None
+                ),
+            }
+        )
+        self.state.add_evidence(run_id)
+        for requirement_id in requirement_ids:
+            self.record_requirement_evidence(
+                requirement_id,
+                "verified" if passed else "failed",
+                "test",
+                [run_id],
+                note=f"run_tests target={target or '.'}",
+            )
+        return run_id
+
+    def check_requirements(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Run typed mechanical verifiers over registered requirements.
+
+        ``context`` supplies the observed facts (signatures, paths, test outcomes,
+        dependencies, output format, measured complexity). A requirement with no
+        mechanical verifier is recorded ``unverified``, never promoted by wording.
+        """
+        from ..requirement_evidence import (
+            apply_requirement_evidence,
+            verify_requirements as _verify_requirements,
+        )
+
+        requirements = [
+            {
+                "requirement_id": requirement_id,
+                "verifier_ids": self.requirement_verifiers.get(requirement_id, []),
+            }
+            for requirement_id in self.requirement_evidence
+        ]
+        report = _verify_requirements(requirements, context)
+        apply_requirement_evidence(self, report)
+        return {
+            requirement_id: evidence.to_dict()
+            for requirement_id, evidence in report.items()
+        }
+
+    def requirement_report(self) -> Dict[str, Any]:
+        """Per-requirement status with the exact evidence ids that back it."""
+        return {
+            requirement_id: evidence.to_dict()
+            for requirement_id, evidence in sorted(self.requirement_evidence.items())
+        }
 
     @staticmethod
     def _serialize(payload: Any) -> str:
@@ -307,26 +545,148 @@ class AgentRuntime:
             replace_block=replace_block,
         )
 
-    def run_tests(self, test_target: str = "", timeout_s: float = 10.0) -> ToolObservation:
+    def run_tests(
+        self,
+        test_target: str = "",
+        timeout_s: float = 10.0,
+        requirement_ids: Sequence[str] = (),
+    ) -> ToolObservation:
         return self.call_tool(
-            "run_tests", test_target=test_target, timeout_s=timeout_s
+            "run_tests",
+            test_target=test_target,
+            timeout_s=timeout_s,
+            requirement_ids=list(requirement_ids),
         )
 
     def revert(self, file_path: str) -> ToolObservation:
         return self.call_tool("git_revert_file", file_path=file_path)
 
-    def finish(self, passed: bool, note: str = "") -> AgentTrajectory:
-        """Close the episode, freezing the trajectory and outcome."""
-        self.trajectory.outcome = 1 if passed else 0
+    @staticmethod
+    def diff_sha256(patch_text: Optional[str]) -> Optional[str]:
+        """Stable hash of the retained patch candidate (``None`` when absent)."""
+        if patch_text is None:
+            return None
+        return hashlib.sha256(str(patch_text).encode("utf-8")).hexdigest()
+
+    def _completion_problems(self, evidence: CompletionEvidence) -> List[str]:
+        """Every reason the reported evidence does not prove a resolved episode."""
+        problems: List[str] = []
+        retained = self.last_patch_text
+        if bool(evidence.patch_applied) != (retained is not None):
+            problems.append("patch_applied disagrees with the retained patch candidate")
+        if retained is not None:
+            expected_hash = self.diff_sha256(retained)
+            if not evidence.final_diff_sha256:
+                problems.append("missing final_diff_sha256 for the retained patch")
+            elif evidence.final_diff_sha256 != expected_hash:
+                problems.append("final_diff_sha256 does not match the retained patch")
+        elif evidence.final_diff_sha256:
+            problems.append("final_diff_sha256 supplied with no retained patch")
+
+        if not evidence.targeted_tests_passed:
+            problems.append("targeted tests did not pass")
+        if not evidence.regression_tests_passed:
+            problems.append("regression tests did not pass")
+        if evidence.static_checks_passed is False:
+            problems.append("static checks failed")
+        if not evidence.test_run_ids:
+            problems.append("no test run ids reported")
+        for run_id in evidence.test_run_ids:
+            run = next((item for item in self._test_runs if item["id"] == run_id), None)
+            if run is None:
+                problems.append(f"unknown test run {run_id}")
+                continue
+            if not run["passed"]:
+                problems.append(f"test run {run_id} did not pass")
+            if int(run["edit_generation"]) != int(self._edit_generation):
+                problems.append(f"test run {run_id} predates the final patch")
+
+        verified_ids = set(evidence.required_constraints_verified)
+        unresolved = set(evidence.unresolved_constraints)
+        if unresolved:
+            problems.append(
+                "unresolved mandatory constraints: " + ", ".join(sorted(unresolved))
+            )
+        waived = set(evidence.waived_constraints)
+        mandatory = {
+            requirement_id
+            for requirement_id, required in self.mandatory_requirements.items()
+            if required
+        }
+        unknown_waivers = waived - mandatory
+        if unknown_waivers:
+            problems.append(
+                "waived constraints that are not registered mandatory requirements: "
+                + ", ".join(sorted(unknown_waivers))
+            )
+        missing = mandatory - waived - verified_ids - unresolved
+        if missing:
+            problems.append(
+                "mandatory requirements missing from evidence: " + ", ".join(sorted(missing))
+            )
+        for requirement_id in sorted(verified_ids):
+            record = self.requirement_evidence.get(requirement_id)
+            if record is None:
+                problems.append(f"requirement {requirement_id} has no recorded evidence")
+            elif record.status != "verified":
+                problems.append(f"requirement {requirement_id} is not verified")
+            elif not record.evidence_ids:
+                problems.append(f"requirement {requirement_id} has no evidence id")
+
+        if (
+            self.state.task_type in _CODE_TASK_TYPES
+            and retained is None
+            and not evidence.patch_applied
+        ):
+            problems.append("code-edit episode finished without a retained patch candidate")
+        return problems
+
+    def finalize(self, evidence: CompletionEvidence, note: str = "") -> AgentTrajectory:
+        """Close the episode from verified evidence, never from a bare boolean."""
+        problems = self._completion_problems(evidence)
+        verified = not problems
+        payload = evidence.to_dict()
+        payload["verified"] = verified
+        payload["problems"] = list(problems)
+        self.trajectory.metadata["completion_evidence"] = payload
         self.trajectory.metadata["note"] = note
         self.trajectory.metadata["steps_used"] = self.state.steps_used
+        self.trajectory.metadata["test_runs"] = [dict(run) for run in self._test_runs]
+        self.trajectory.metadata["requirements"] = self.requirement_report()
+        self.trajectory.metadata["final_phase"] = self.state.phase
+        self.trajectory.metadata["rejected_approaches"] = list(self.state.rejected_approaches)
+        self.trajectory.final_patch = self.last_patch_text
+        self.trajectory.outcome = 1 if verified else 0
+        try:
+            self.state.finalize(verified)
+        except ReasoningStateError:
+            self.state.phase = "DONE" if verified else "FAILED"
+            self.state.finished = True
+        return self.trajectory
+
+    def finish(self, passed: bool = False, note: str = "") -> AgentTrajectory:
+        """Deprecated boolean finalizer; it can never produce a resolved trajectory.
+
+        Use :meth:`finalize` with :class:`CompletionEvidence`. Any caller that still
+        passes ``True`` gets an unresolved trajectory whose metadata says why, so the
+        label can never leak into training as a success.
+        """
+        self.trajectory.outcome = 0
+        self.trajectory.metadata["completion_evidence"] = {
+            "verified": False,
+            "claimed_passed": bool(passed),
+            "problems": ["caller-supplied boolean is not completion evidence"],
+        }
+        self.trajectory.metadata["note"] = note
+        self.trajectory.metadata["steps_used"] = self.state.steps_used
+        self.trajectory.metadata["requirements"] = self.requirement_report()
         self.trajectory.metadata["final_phase"] = self.state.phase
         self.trajectory.metadata["rejected_approaches"] = list(self.state.rejected_approaches)
         self.trajectory.final_patch = self.last_patch_text
         try:
-            self.state.finalize(bool(passed))
+            self.state.finalize(False)
         except ReasoningStateError:
-            self.state.phase = "DONE" if passed else "FAILED"
+            self.state.phase = "FAILED"
             self.state.finished = True
         return self.trajectory
 

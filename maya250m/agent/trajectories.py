@@ -87,7 +87,16 @@ class AgentTrajectory:
 
     @property
     def resolved(self) -> bool:
-        return int(self.outcome) >= int(RESOLVED_THRESHOLD)
+        """A trajectory resolves only from verified completion evidence.
+
+        ``outcome`` alone is a numeric label; without the structured evidence block
+        written by ``AgentRuntime.finalize`` it cannot make a trajectory an RL/success
+        target (a caller-supplied ``finish(True)`` used to do exactly that).
+        """
+        if int(self.outcome) < int(RESOLVED_THRESHOLD):
+            return False
+        evidence = self.metadata.get("completion_evidence")
+        return isinstance(evidence, dict) and bool(evidence.get("verified"))
 
     def tools_used(self) -> List[str]:
         return [s.tool_name for s in self.steps if s.tool_name]

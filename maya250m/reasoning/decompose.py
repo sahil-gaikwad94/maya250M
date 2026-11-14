@@ -19,9 +19,16 @@ __all__ = [
     "decompose_task",
     "StrategySelector",
     "STRATEGIES",
+    "counterexample_first_plan",
+    "certify_universal_claim",
+    "RESEARCH_STRATEGY",
 ]
 
+#: CONJECTURE -> FALSIFY -> PROVE strategy for open mathematical/empirical claims.
+RESEARCH_STRATEGY = "falsify_then_prove"
+
 STRATEGIES = (
+    RESEARCH_STRATEGY,
     "localize_then_patch",
     "reproduce_then_patch",
     "derive_then_verify",
@@ -221,6 +228,91 @@ def decompose_task(
         ]
 
     return Decomposition(subproblems=subproblems, strategy=strategy)
+
+
+def counterexample_first_plan(
+    claim: str,
+    sweep_n: int = 15,
+    falsify_n: int = 500,
+) -> Decomposition:
+    """Structured CONJECTURE -> FALSIFY -> PROVE decomposition for a claim.
+
+    Stage 1 sweeps small ``n`` and records exact observations, stage 2 fits a
+    symbolic pattern, stage 3 runs an adversarial falsification sweep, and stage 4
+    refuses universality without an algebraic identity proof. The DAG encodes the
+    order so a bounded agent cannot skip falsification and jump to a proof claim.
+    """
+    if sweep_n < 1 or falsify_n < sweep_n:
+        raise DecompositionError("need 1 <= sweep_n <= falsify_n")
+    claim_text = str(claim or "").strip() or "the stated claim"
+    return Decomposition(
+        strategy=RESEARCH_STRATEGY,
+        subproblems=[
+            Subproblem(
+                "sweep",
+                f"<experiment>#1: enumerate n in 1..{sweep_n} and emit exact "
+                f"[OBS: ...] values for {claim_text}",
+                kind="derive",
+                acceptance="exact observed values, no rounding",
+            ),
+            Subproblem(
+                "fit",
+                "<<...>> / <experiment>#2: fit a polynomial, rational or recurrence "
+                "candidate and check it reproduces every observation",
+                kind="derive",
+                depends_on=["sweep"],
+                acceptance="closed form matches all observed values",
+            ),
+            Subproblem(
+                "falsify",
+                f"<experiment>#3: adversarial counterexample search up to N={falsify_n}",
+                kind="verify",
+                depends_on=["fit"],
+                acceptance="no counterexample found, or it is reported explicitly",
+            ),
+            Subproblem(
+                "prove",
+                "Symbolic identity proof (safe_sympy(lhs - rhs) == 0) before any "
+                "\"for all n\" claim",
+                kind="verify",
+                depends_on=["falsify"],
+                acceptance="universality is claimed only with an algebraic identity",
+            ),
+        ],
+    )
+
+
+def certify_universal_claim(
+    finite_checks: int,
+    counterexample: Optional[object] = None,
+    identity_verified: bool = False,
+) -> Dict[str, object]:
+    """Decide what a claim's evidence actually licenses.
+
+    A counterexample refutes; an algebraic identity proves; anything else is a
+    conjecture supported only by finitely many checks and may never be reported as
+    proven for all ``n``.
+    """
+    checks = int(finite_checks)
+    if checks < 0:
+        raise ValueError("finite_checks must be non-negative")
+    if counterexample is not None:
+        return {
+            "verdict": "REFUTED",
+            "may_claim_for_all_n": False,
+            "explanation": f"counterexample found: {counterexample!r}",
+        }
+    if identity_verified:
+        return {
+            "verdict": "PROVEN",
+            "may_claim_for_all_n": True,
+            "explanation": "symbolic identity verified (lhs - rhs == 0)",
+        }
+    return {
+        "verdict": "CONJECTURE_ONLY",
+        "may_claim_for_all_n": False,
+        "explanation": f"only {checks} finite checks; no algebraic identity proof",
+    }
 
 
 #: Ambiguity flags that are disqualifying on their own: the objective cannot be
