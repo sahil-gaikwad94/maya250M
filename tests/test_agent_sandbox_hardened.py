@@ -103,6 +103,11 @@ class TestCommandPolicy(unittest.TestCase):
 class TestContainerSandboxEndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Probe availability fresh for this test class, because the global cache
+        # may have been set by a previous import or test run.
+        from maya250m.agent.sandbox import _CONTAINER_AVAILABLE, _CONTAINER_PROBE_FAILED
+        _CONTAINER_AVAILABLE = None
+        _CONTAINER_PROBE_FAILED = None
         cls.available, cls.reason = sb.is_container_backend_available()
 
     def setUp(self):
