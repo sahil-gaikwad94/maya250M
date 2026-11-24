@@ -64,5 +64,40 @@ class TestMBRSelection(unittest.TestCase):
             self.vexx.select_by_mbr([DOUBLE], "f", [])
 
 
+
+    def test_posterior_log_probs_shift_bayes_risk(self):
+        # With uniform prior, DOUBLE and WRONG tie 1-1 on votes, broken by AST depth.
+        # With strong posterior log-prob on WRONG, WRONG has lower expected Bayes risk.
+        res = self.vexx.select_by_mbr(
+            [DOUBLE, WRONG], "f", self.probes, log_probs=[-5.0, -0.1], temperature=1.0
+        )
+        self.assertEqual(res["winner"], WRONG)
+        self.assertLess(res["bayes_risk"], 0.1)
+        self.assertGreater(res["expected_utility"], 0.9)
+
+    def test_partial_probe_agreement_minimizes_hamming_bayes_risk(self):
+        c1 = "def f(x):\n    return [1, 2, 3][x]\n"
+        c2 = "def f(x):\n    return [1, 2, 9][x]\n"
+        c3 = "def f(x):\n    return [1, 8, 3][x]\n"
+        # All three have distinct 3-probe output tuples (1 vote each), but c1 agrees
+        # with c2 on 2/3 probes and with c3 on 2/3 probes -> lowest Bayes risk (2/9 vs 3/9)!
+        res = self.vexx.select_by_mbr([c2, c3, c1], "f", [[0], [1], [2]])
+        self.assertEqual(res["winner"], c1)
+        self.assertAlmostEqual(res["bayes_risk"], 2.0 / 9.0, places=6)
+
+    def test_lexer_state_preserves_backslash_escape_across_token_chunks(self):
+        from maya250m.vexx import LexerState, advance_lexer_state
+
+        st1 = advance_lexer_state(LexerState(), 's = "hello\\')
+        self.assertEqual(st1.in_str, '"')
+        self.assertTrue(st1.escape)
+        st2 = advance_lexer_state(st1, '" + "world"')
+        # The quote after the trailing backslash was escaped, so " + " opened/closed a string
+        # and the final quote closed the string cleanly!
+        full = advance_lexer_state(LexerState(), 's = "hello\\" + "world"')
+        self.assertEqual(st2.in_str, full.in_str)
+        self.assertEqual(st2.valid, full.valid)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

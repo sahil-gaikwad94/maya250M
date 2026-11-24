@@ -356,5 +356,68 @@ class TestRuntime(AgentFixture):
         self.assertAlmostEqual(reward.total, 1.0 - 0.15, places=6)
 
 
+
+    def test_multi_test_requirement_needs_all_bound_tests_before_verified(self) -> None:
+        runtime = self._runtime()
+        extra_test_path = os.path.join(self.root, "tests", "test_add_extra.py")
+        with open(extra_test_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, sys, unittest\n"
+                "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+                "from pkg.mathx import add\n"
+                "class TestAddExtra(unittest.TestCase):\n"
+                "    def test_add_neg(self):\n"
+                "        self.assertEqual(add(-2, 5), 3)\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n"
+            )
+        try:
+            req_id = runtime.register_requirement(
+                "add() passes both unit test suites",
+                test_ids=["tests/test_add.py", "tests/test_add_extra.py"],
+            )
+            runtime.localize("add")
+            runtime.inspect("add")
+            runtime.patch(
+                "pkg/mathx.py", "    return a - b  # BUG: should be +", "    return a + b"
+            )
+            # Running only 1 of 2 bound test files must keep status at 'addressed', not 'verified'
+            res1 = runtime.run_tests("tests/test_add.py", timeout_s=60, requirement_ids=[req_id])
+            self.assertTrue(res1.passed)
+            self.assertEqual(runtime.requirement_evidence[req_id].status, "addressed")
+
+            # Running the second bound test file promotes req_id to 'verified'
+            res2 = runtime.run_tests("tests/test_add_extra.py", timeout_s=60, requirement_ids=[req_id])
+            self.assertTrue(res2.passed)
+            self.assertEqual(runtime.requirement_evidence[req_id].status, "verified")
+        finally:
+            runtime.tools.git_revert_file("pkg/mathx.py")
+            if os.path.exists(extra_test_path):
+                os.remove(extra_test_path)
+
+    def test_subsequent_edit_invalidates_prior_verified_status(self) -> None:
+        runtime = self._runtime()
+        req_id = runtime.register_requirement(
+            "add() returns a + b", test_ids=["tests/test_add.py"]
+        )
+        runtime.localize("add")
+        runtime.inspect("add")
+        runtime.patch(
+            "pkg/mathx.py", "    return a - b  # BUG: should be +", "    return a + b"
+        )
+        try:
+            res = runtime.run_tests("tests/test_add.py", timeout_s=60, requirement_ids=[req_id])
+            self.assertTrue(res.passed)
+            self.assertEqual(runtime.requirement_evidence[req_id].status, "verified")
+
+            # Applying another edit must downgrade 'verified' back to 'addressed' until tests re-run
+            runtime.patch(
+                "pkg/mathx.py", "    return a + b", "    return int(a + b)"
+            )
+            self.assertEqual(runtime.requirement_evidence[req_id].status, "addressed")
+        finally:
+            runtime.tools.git_revert_file("pkg/mathx.py")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

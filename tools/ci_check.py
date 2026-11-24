@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""Clean-checkout import gate (P0.1).
+"""Clean-checkout import and collection gate (P0.1 — with unittest fallback).
 
-Two checks that must pass on every node, including CPU-only shards where PyTorch is
-absent:
+Two checks that must pass on every node, including CPU-only shards where PyTorch or
+pytest is absent:
 
 1. every package/test/tool/kaggle module compiles (``compileall``), and
-2. the whole test suite is *collectable* (``pytest --collect-only``), which catches
-   stray Markdown fences, bad imports and unguarded optional dependencies before
-   they silently hide tests.
-
-Usage::
-
-    python3 tools/ci_check.py            # compile + collect
-    python3 tools/ci_check.py --no-collect
-    python3 tools/ci_check.py --run      # also execute the suite
+2. the whole test suite is *collectable* and runnable via ``pytest`` (or Python's
+   built-in ``unittest`` loader when ``pytest`` is not installed), catching stray
+   Markdown fences, bad imports and unguarded optional dependencies before they
+   silently hide tests.
 """
 
 from __future__ import annotations
 
 import argparse
 import compileall
+import importlib.util
 import pathlib
 import subprocess
 import sys
+import unittest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE_DIRECTORIES = ("maya250m", "tests", "tools", "kaggle")
@@ -37,7 +34,6 @@ def compile_everything() -> bool:
             print(f"MISSING   {directory}", file=sys.stderr)
             ok = False
             continue
-        # ``quiet=True`` suppresses per-file output; it does not suppress errors.
         if not compileall.compile_dir(str(target), quiet=1, force=True):
             print(f"COMPILE   {directory}: FAILED", file=sys.stderr)
             ok = False
@@ -57,7 +53,48 @@ def compile_everything() -> bool:
     return ok
 
 
+def _has_pytest() -> bool:
+    return importlib.util.find_spec("pytest") is not None
+
+
+def _collect_unittest() -> bool:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    loader = unittest.TestLoader()
+    suite = loader.discover(str(PROJECT_ROOT / "tests"))
+    if loader.errors:
+        for err in loader.errors:
+            print(err, file=sys.stderr)
+        print(f"COLLECT: FAILED ({len(loader.errors)} import error(s))", file=sys.stderr)
+        return False
+    count = suite.countTestCases()
+    if count <= 0:
+        print("COLLECT: FAILED (0 tests discovered)", file=sys.stderr)
+        return False
+    print(f"COLLECT: ok ({count} tests via unittest)")
+    return True
+
+
+def _run_unittest() -> bool:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    loader = unittest.TestLoader()
+    suite = loader.discover(str(PROJECT_ROOT / "tests"))
+    runner = unittest.TextTestRunner(verbosity=1)
+    result = runner.run(suite)
+    if not result.wasSuccessful():
+        print(
+            f"TESTS: FAILED (failures={len(result.failures)}, errors={len(result.errors)})",
+            file=sys.stderr,
+        )
+        return False
+    print(f"TESTS: ok ({result.testsRun} ran, {len(result.skipped)} skipped)")
+    return True
+
+
 def run_pytest(extra_args: list[str], label: str) -> bool:
+    if not _has_pytest():
+        if "--collect-only" in extra_args:
+            return _collect_unittest()
+        return _run_unittest()
     command = [sys.executable, "-m", "pytest", "tests/"] + extra_args
     try:
         completed = subprocess.run(command, cwd=PROJECT_ROOT)
@@ -74,7 +111,7 @@ def run_pytest(extra_args: list[str], label: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--no-collect", action="store_true", help="skip pytest --collect-only"
+        "--no-collect", action="store_true", help="skip test collection"
     )
     parser.add_argument("--run", action="store_true", help="also execute the suite")
     args = parser.parse_args(argv)

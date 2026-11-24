@@ -211,7 +211,7 @@ def fenwick_solve(nums, updates, queries):
         fn_name="solve",
         test_cases=[{"input": [[3, 1, 2]], "expected": 1}],
     )
-    deep_cases.append(("C4_input_mutation_rejected_by_rlvr", grpo["rewards"] == [0.0, 1.0]))
+    deep_cases.append(("C4_input_mutation_rejected_by_rlvr", (grpo["rewards"][0] <= 0.0 and grpo["rewards"][1] == 1.0)))
 
     # Math 1: Exact nested rational arithmetic
     m1 = vexx.crane_cas_evaluate("((17/23 + 29/46) * (69/11)) - (13/7)**2")

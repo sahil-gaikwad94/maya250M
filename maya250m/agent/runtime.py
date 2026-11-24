@@ -7,21 +7,25 @@ The runtime is the only place allowed to execute a tool. It enforces:
 * a **duplicate-action loop breaker**: an identical read/search action repeated
   without an intervening edit is intercepted and answered with a guard message
   instead of being executed again;
-* the tool-output firewall, so no observation reaches model context unfenced.
+* the tool-output firewall, so no observation reaches model context unfenced;
+* strict multi-test requirement verification: a requirement bound to multiple
+  test targets becomes ``verified`` only after *every* bound test target has
+  passed at the current ``edit_generation``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..reasoning.state import (
     PHASE_HYPOTHESIZE,
     PHASE_REPRODUCE,
-    PHASE_VERIFY,
     PHASE_TRANSITIONS,
+    PHASE_VERIFY,
     ReasoningState,
     ReasoningStateError,
 )
@@ -62,7 +66,7 @@ _READ_TOOLS = {
     "view_file_span",
     "inspect_symbol_graph",
 }
-_EDIT_TOOLS = {"apply_patch", "git_revert_file"}
+_EDIT_TOOLS = {"apply_patch", "apply_patch_set", "git_revert_file"}
 
 #: Next phase to try after a successful call; applied only when the edge is legal.
 _PHASE_AFTER_TOOL = {
@@ -72,8 +76,33 @@ _PHASE_AFTER_TOOL = {
     "view_file_span": PHASE_REPRODUCE,
     "inspect_symbol_graph": PHASE_REPRODUCE,
     "apply_patch": PHASE_VERIFY,
+    "apply_patch_set": PHASE_VERIFY,
     "git_revert_file": PHASE_HYPOTHESIZE,
 }
+
+_NORM_SLASH = re.compile(r"[\\/]+")
+
+
+def _norm_target(path: str) -> str:
+    return _NORM_SLASH.sub("/", str(path or "").strip()).lstrip("./")
+
+
+def _target_covers_declared(executed_target: str, declared_test_id: str) -> bool:
+    """True when running ``executed_target`` executes ``declared_test_id`` without suffix spoofing."""
+    exec_norm = _norm_target(executed_target).rstrip("/")
+    decl_norm = _norm_target(declared_test_id).rstrip("/")
+    if not exec_norm or not decl_norm:
+        return False
+    if exec_norm == decl_norm:
+        return True
+    # Boundary-aware suffix match (e.g. "/abs/repo/tests/test_add.py" covers "tests/test_add.py",
+    # whereas "tests/other_add.py" NEVER covers "add.py").
+    if exec_norm.endswith("/" + decl_norm):
+        return True
+    # Directory target covers test files inside that directory only if explicitly a directory prefix.
+    if decl_norm.startswith(exec_norm + "/") and not exec_norm.endswith(".py"):
+        return True
+    return False
 
 
 @dataclass
@@ -129,9 +158,9 @@ class CompletionEvidence:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "patch_applied": bool(self.patch_applied),
-            "targeted_tests_passed": bool(self.targeted_tests_passed),
-            "regression_tests_passed": bool(self.regression_tests_passed),
+            "patch_applied": bool(evidence_bool(self.patch_applied)),
+            "targeted_tests_passed": bool(evidence_bool(self.targeted_tests_passed)),
+            "regression_tests_passed": bool(evidence_bool(self.regression_tests_passed)),
             "static_checks_passed": self.static_checks_passed,
             "required_constraints_verified": list(self.required_constraints_verified),
             "unresolved_constraints": list(self.unresolved_constraints),
@@ -139,6 +168,10 @@ class CompletionEvidence:
             "test_run_ids": list(self.test_run_ids),
             "waived_constraints": list(self.waived_constraints),
         }
+
+
+def evidence_bool(val: Any) -> bool:
+    return val is True
 
 
 @dataclass
@@ -197,8 +230,11 @@ class AgentRuntime:
         self.last_patch_text: Optional[str] = None
         self.requirement_evidence: Dict[str, ConstraintEvidence] = {}
         self.requirement_test_map: Dict[str, List[str]] = {}
+        self.requirement_texts: Dict[str, str] = {}
         self.mandatory_requirements: Dict[str, bool] = {}
         self.requirement_verifiers: Dict[str, List[str]] = {}
+        self._passed_tests_by_req: Dict[str, Set[str]] = {}
+        self._evidence_runs_by_req: Dict[str, List[str]] = {}
         self._test_runs: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ helpers
@@ -206,6 +242,20 @@ class AgentRuntime:
     @staticmethod
     def _action_key(tool_name: str, kwargs: Dict[str, Any]) -> str:
         return f"{tool_name}::{json.dumps(kwargs, sort_keys=True, default=str)}"
+
+    def _invalidate_post_edit_test_progress(self) -> None:
+        """Any new code edit invalidates earlier test-run proof until re-tested."""
+        self._passed_tests_by_req.clear()
+        self._evidence_runs_by_req.clear()
+        for req_id, ev in list(self.requirement_evidence.items()):
+            if ev.evidence_kind == "test" and ev.status == "verified":
+                self.record_requirement_evidence(
+                    req_id,
+                    "addressed",
+                    "test",
+                    ev.evidence_ids,
+                    note="invalidated by subsequent edit; re-run required tests",
+                )
 
     def _maybe_advance(self, tool_name: str) -> None:
         target = _PHASE_AFTER_TOOL.get(tool_name)
@@ -315,24 +365,30 @@ class AgentRuntime:
             verification = result
             status = "ok" if result.passed else "failed"
 
-        if verification is not None and verification.passed and tool_name == "apply_patch":
+        if verification is not None and verification.passed and tool_name in ("apply_patch", "apply_patch_set"):
             self._edit_generation += 1
-            self.last_patch_text = kwargs.get("replace_block")
+            self._invalidate_post_edit_test_progress()
+            self.last_patch_text = kwargs.get("replace_block") or kwargs.get("patch_text")
             self.state.record_hypothesis(
-                f"patch {kwargs.get('file_path')}", patch_targets=[kwargs.get("file_path", "")]
+                f"patch {kwargs.get('file_path', 'patch_set')}",
+                patch_targets=[kwargs.get("file_path", "")] if kwargs.get("file_path") else [],
             )
             try:
                 self.state.record_verification(verification)
             except ReasoningStateError:  # pragma: no cover - defensive
                 pass
-        elif verification is not None and not verification.passed and tool_name == "apply_patch":
+        elif verification is not None and not verification.passed and tool_name in ("apply_patch", "apply_patch_set"):
             self._edit_generation += 1
             if not self.state.hypotheses:
-                self.state.record_hypothesis(f"patch {kwargs.get('file_path')}")
+                self.state.record_hypothesis(f"patch {kwargs.get('file_path', 'patch_set')}")
             try:
                 self.state.record_verification(verification)
             except ReasoningStateError:  # pragma: no cover - defensive
                 pass
+        elif verification is not None and verification.passed and tool_name == "git_revert_file":
+            self._edit_generation += 1
+            self._invalidate_post_edit_test_progress()
+            self.last_patch_text = None
 
         payload = result if result is not None else (verification.to_dict() if verification else "error")
         fenced_text, audit = self.firewall.wrap(tool_name, self._serialize(payload))
@@ -370,6 +426,7 @@ class AgentRuntime:
             self.state.constraints.append(text)
         elif text:
             self.state.pin_fact(f"requirement {requirement_id}: {text}")
+        self.requirement_texts[requirement_id] = str(text or "")
         self.state.constraint_status.setdefault(requirement_id, False)
         self.mandatory_requirements[requirement_id] = bool(mandatory)
         self.requirement_evidence.setdefault(
@@ -391,7 +448,7 @@ class AgentRuntime:
         """Declare exactly which test targets verify ``requirement_id``."""
         mapping = self.requirement_test_map.setdefault(requirement_id, [])
         for test_id in test_ids:
-            cleaned = str(test_id).strip()
+            cleaned = _norm_target(test_id)
             if cleaned and cleaned not in mapping:
                 mapping.append(cleaned)
 
@@ -423,16 +480,15 @@ class AgentRuntime:
         """Requirements whose declared test ids match ``test_target``.
 
         An empty target runs the whole suite, which does not *prove* that any
-        particular requirement's test executed, so it maps to nothing.
+        particular requirement's test executed unless bound explicitly.
         """
-        target = str(test_target or "").strip().replace("\\", "/")
+        target = _norm_target(test_target)
         if not target:
             return []
         matched: List[str] = []
         for requirement_id, test_ids in self.requirement_test_map.items():
             for test_id in test_ids:
-                declared = str(test_id).replace("\\", "/")
-                if target == declared or target.endswith(declared) or declared.endswith(target):
+                if _target_covers_declared(target, test_id):
                     matched.append(requirement_id)
                     break
         return matched
@@ -440,13 +496,16 @@ class AgentRuntime:
     def record_test_run(
         self, kwargs: Dict[str, Any], verification: Optional[VerificationResult]
     ) -> str:
-        """Log one test command and update only the requirements it covers."""
-        target = str(kwargs.get("test_target") or "")
+        """Log one test command and update only the requirements it covers.
+
+        When a requirement has multiple bound ``test_ids``, it reaches ``verified``
+        only after *all* bound ``test_ids`` have passed at the current edit generation.
+        """
+        target = _norm_target(kwargs.get("test_target") or "")
         passed = bool(verification is not None and verification.passed)
         run_id = f"test_run_{len(self._test_runs) + 1}"
-        requirement_ids = list(kwargs.get("requirement_ids") or ())
-        if not requirement_ids:
-            requirement_ids = self._requirements_for_target(target)
+        explicit_reqs = list(kwargs.get("requirement_ids") or ())
+        requirement_ids = explicit_reqs if explicit_reqs else self._requirements_for_target(target)
         self._test_runs.append(
             {
                 "id": run_id,
@@ -464,13 +523,54 @@ class AgentRuntime:
         )
         self.state.add_evidence(run_id)
         for requirement_id in requirement_ids:
-            self.record_requirement_evidence(
-                requirement_id,
-                "verified" if passed else "failed",
-                "test",
-                [run_id],
-                note=f"run_tests target={target or '.'}",
-            )
+            declared_tests = self.requirement_test_map.get(requirement_id) or []
+            if not passed:
+                self._passed_tests_by_req.pop(requirement_id, None)
+                self.record_requirement_evidence(
+                    requirement_id,
+                    "failed",
+                    "test",
+                    [run_id],
+                    note=f"run_tests failed on target={target or '.'}",
+                )
+                continue
+
+            runs_for_req = self._evidence_runs_by_req.setdefault(requirement_id, [])
+            if run_id not in runs_for_req:
+                runs_for_req.append(run_id)
+
+            if len(declared_tests) <= 1:
+                self.record_requirement_evidence(
+                    requirement_id,
+                    "verified",
+                    "test",
+                    list(runs_for_req),
+                    note=f"run_tests target={target or '.'}",
+                )
+            else:
+                covered_set = self._passed_tests_by_req.setdefault(requirement_id, set())
+                for decl in declared_tests:
+                    if _target_covers_declared(target, decl):
+                        covered_set.add(decl)
+                if all(decl in covered_set for decl in declared_tests):
+                    self.record_requirement_evidence(
+                        requirement_id,
+                        "verified",
+                        "test",
+                        list(runs_for_req),
+                        note=f"all {len(declared_tests)} bound test targets passed",
+                    )
+                else:
+                    self.record_requirement_evidence(
+                        requirement_id,
+                        "addressed",
+                        "test",
+                        list(runs_for_req),
+                        note=(
+                            f"partial test coverage: {len(covered_set)}/{len(declared_tests)} "
+                            f"bound test targets passed ({sorted(covered_set)})"
+                        ),
+                    )
         return run_id
 
     def check_requirements(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -488,7 +588,9 @@ class AgentRuntime:
         requirements = [
             {
                 "requirement_id": requirement_id,
+                "text": self.requirement_texts.get(requirement_id, ""),
                 "verifier_ids": self.requirement_verifiers.get(requirement_id, []),
+                "required_test_ids": self.requirement_test_map.get(requirement_id) or None,
             }
             for requirement_id in self.requirement_evidence
         ]
@@ -591,6 +693,8 @@ class AgentRuntime:
             problems.append("static checks failed")
         if not evidence.test_run_ids:
             problems.append("no test run ids reported")
+
+        valid_current_runs: List[Dict[str, Any]] = []
         for run_id in evidence.test_run_ids:
             run = next((item for item in self._test_runs if item["id"] == run_id), None)
             if run is None:
@@ -600,6 +704,21 @@ class AgentRuntime:
                 problems.append(f"test run {run_id} did not pass")
             if int(run["edit_generation"]) != int(self._edit_generation):
                 problems.append(f"test run {run_id} predates the final patch")
+            if run["passed"] and int(run["edit_generation"]) == int(self._edit_generation):
+                valid_current_runs.append(run)
+
+        # Verify that regression_tests_passed is backed by a suite/directory test run
+        # or complete coverage of all registered test files, not just a single narrow file
+        # when other test targets exist.
+        if evidence.regression_tests_passed and valid_current_runs:
+            has_suite_run = any(
+                not str(r.get("target") or "").strip().endswith(".py")
+                for r in valid_current_runs
+            )
+            if not has_suite_run and len(valid_current_runs) < 2 and len(self.requirement_test_map) > 1:
+                problems.append(
+                    "regression_tests_passed claimed with only a single narrow test file run"
+                )
 
         verified_ids = set(evidence.required_constraints_verified)
         unresolved = set(evidence.unresolved_constraints)

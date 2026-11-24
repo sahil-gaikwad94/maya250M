@@ -28,7 +28,13 @@ from .evaluation.identity import Measurement, MeasurementIdentity, MeasurementSt
 from .generate import PLAIN, GenerationResult, generate_maya
 from .reasoning.controller import AdaptiveLoopController
 from .reasoning.correction import CorrectionPolicy
-from .reasoning.decompose import CRITICAL_AMBIGUITY_FLAGS, decompose_task
+from .reasoning.decompose import (
+    CRITICAL_AMBIGUITY_FLAGS,
+    RESEARCH_STRATEGY,
+    certify_universal_claim,
+    decompose_task,
+    is_conjecture_or_universal_claim,
+)
 from .reasoning.state import ReasoningState
 from .understanding import TaskSpec, parse_task_spec
 from .verification import VerificationResult, failure, ok
@@ -96,10 +102,14 @@ class SolveResult:
 
     @property
     def verified(self) -> bool:
-        return bool(self.verification is not None and self.verification.passed)
+        if self.verification is None or not self.verification.passed:
+            return False
+        if bool(self.verification.details.get("lexical_only")):
+            return False
+        return True
 
     def measurement(self) -> Measurement:
-        """Pass/fail measurement, or ``NOT_RUN`` when nothing verified the answer."""
+        """Pass/fail measurement, or ``NOT_RUN`` when nothing mechanically verified the answer."""
         if self.verification is None:
             return Measurement(
                 identity=self.identity,
@@ -107,10 +117,22 @@ class SolveResult:
                 status=MeasurementStatus.NOT_RUN,
                 metadata={"reason": "no executable verifier was supplied", "prompt": self.prompt[:120]},
             )
+        if self.verification.passed and bool(self.verification.details.get("lexical_only")):
+            return Measurement(
+                identity=self.identity,
+                name="solve_verified",
+                status=MeasurementStatus.NOT_RUN,
+                metadata={
+                    "reason": "lexical addressing check passed, but no mechanical verifier was supplied",
+                    "status": "addressed",
+                    "loops": self.loops_used,
+                    "attempts": self.attempts,
+                },
+            )
         return Measurement(
             identity=self.identity,
             name="solve_verified",
-            value=1.0 if self.verification.passed else 0.0,
+            value=1.0 if self.verified else 0.0,
             n=1,
             unit="pass_rate",
             metadata={
@@ -276,11 +298,40 @@ def solve_task(
         return result
 
     # 2. Verify with an executable check whenever one exists.
+    # For universal/conjecture research tasks, attach a universal-claim certification
+    # check so uncertified "for all n" claims without an algebraic identity proof fail.
     check = verifier
     if check is None and cfg.constraint_check and spec.constraints and "constraint_check" not in disabled:
-        from .evaluation.harness import constraint_verifier
+        from .evaluation.harness import lexical_constraint_verifier
 
-        check = constraint_verifier(spec)
+        check = lexical_constraint_verifier(spec)
+    if check is None and is_conjecture_or_universal_claim(spec) and "self_correction" not in disabled:
+        def _research_claim_verifier(sample_text: str) -> VerificationResult:
+            lower = str(sample_text or "").lower()
+            claims_universal = any(
+                phrase in lower
+                for phrase in ("for all n", "proven for all", "every n ", "always prime", "holds for all")
+            )
+            has_counterexample = "counterexample" in lower or "refuted" in lower
+            has_identity_proof = "identity_verified" in lower or "lhs - rhs == 0" in lower
+            cert = certify_universal_claim(
+                finite_checks=15,
+                counterexample="reported_in_text" if has_counterexample else None,
+                identity_verified=has_identity_proof,
+            )
+            if claims_universal and not bool(cert["may_claim_for_all_n"]):
+                return failure(
+                    "wrong_answer",
+                    f"universal claim not licensed by evidence ({cert['explanation']})",
+                    certification=cert,
+                )
+            return ok(
+                "research claim adheres to counterexample-first certification",
+                certification=cert,
+                strategy=RESEARCH_STRATEGY,
+            )
+
+        check = _research_claim_verifier
     if "constraint_check" in disabled:
         check = verifier
     policy = CorrectionPolicy(max_attempts=max(1, int(cfg.max_attempts) - 1))

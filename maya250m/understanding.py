@@ -107,7 +107,7 @@ _TASK_KEYWORDS = {
     "code_edit": ("add", "implement", "update", "modify", "change", "rename", "remove", "patch"),
     "code_generation": ("write a function", "generate", "create a class", "scaffold"),
     "math": ("prove", "derive", "solve", "integral", "derivative", "probability", "compute"),
-    "research": ("paper", "hypothesis", "experiment", "literature", "evidence", "cite"),
+    "research": ("paper", "hypothesis", "experiment", "literature", "evidence", "cite", "conjecture", "counterexample", "falsif", "for all n", "is every"),
     "refactor": ("refactor", "clean up", "simplify", "extract method", "decouple"),
     "test_writing": ("write tests", "unit test", "pytest", "coverage"),
     "explanation": ("explain", "why does", "how does", "walk me through"),
@@ -453,8 +453,14 @@ class NeuralTaskSpecParser:
         self._dirty = False
         return self.impl
 
-    def predict(self, hidden) -> TaskSpec:
-        """Predict a ``TaskSpec`` from a pooled hidden state (requires ``build``)."""
+    def predict(
+        self,
+        hidden,
+        prompt_text: str = "",
+        repo_files: Optional[Sequence[str]] = None,
+        repo_symbols: Optional[Sequence[str]] = None,
+    ) -> TaskSpec:
+        """Predict a grounded ``TaskSpec`` from a pooled hidden state and optional prompt text."""
         import torch
 
         if self.impl is None:
@@ -462,8 +468,31 @@ class NeuralTaskSpecParser:
         self.impl.eval()
         with torch.no_grad():
             out = self.impl(hidden)
-            idx = int(torch.argmax(out["task_type_logits"], dim=-1).item())
+            probs = torch.softmax(out["task_type_logits"], dim=-1)
+            idx = int(torch.argmax(probs, dim=-1).item())
+            task_prob = float(probs.reshape(-1)[idx].item())
             ambiguity = float(torch.sigmoid(out["ambiguity_logit"]).item())
+
+        if isinstance(prompt_text, str) and prompt_text.strip():
+            base = parse_task_spec(
+                prompt_text, repo_files=repo_files, repo_symbols=repo_symbols
+            )
+            flags = list(base.ambiguity_flags)
+            if ambiguity > 0.5 and "neural_ambiguity_flag" not in flags:
+                flags.append("neural_ambiguity_flag")
+            return TaskSpec(
+                objective=base.objective,
+                task_type=TASK_TYPES[idx] if TASK_TYPES[idx] != "unknown" else base.task_type,
+                requirements=base.requirements,
+                constraints=base.constraints,
+                entities=base.entities,
+                files_mentioned=base.files_mentioned,
+                symbols_mentioned=base.symbols_mentioned,
+                output_format=base.output_format,
+                ambiguity_flags=flags,
+                confidence=float(min(0.99, max(0.01, 0.5 * (1.0 - ambiguity) + 0.5 * task_prob))),
+                provenance="neural_hybrid",
+            )
         return TaskSpec(
             objective="",
             task_type=TASK_TYPES[idx],

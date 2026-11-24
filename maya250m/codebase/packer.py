@@ -25,6 +25,7 @@ __all__ = [
     "RepoTokens",
     "PackedRepo",
     "TopologicalRepoPacker",
+    "TaskContextPacker",
     "FIM_MARKERS",
     "FIMSpan",
     "ast_span_candidates",
@@ -340,3 +341,101 @@ def fim_example(
         "middle": middle,
         "suffix": suffix,
     }
+
+
+class TaskContextPacker:
+    """Role-budgeted repository context packer with 1-hop dependency expansion.
+
+    Allocates ``token_budget`` across four evidence roles rather than greedily
+    filling the window with the first N files:
+    1. ``implementation`` (target files & symbols);
+    2. ``contracts_and_callers`` (1-hop callers, callees, and imported dependencies);
+    3. ``tests`` (test files importing or calling the target symbols);
+    4. ``repomap`` (compact symbol signatures for global navigation).
+    """
+
+    def __init__(self, indexer: RepoGraphIndexer):
+        self.indexer = indexer
+        self.topo_packer = TopologicalRepoPacker(indexer)
+
+    def expand_neighborhood(
+        self, seed_files: Sequence[str] = (), seed_symbols: Sequence[str] = ()
+    ) -> Dict[str, List[str]]:
+        """ Partition relevant files into implementation, 1-hop neighbors, and tests."""
+        from .transaction import is_test_path
+
+        impl_files: List[str] = []
+        neighbor_files: List[str] = []
+        test_files: List[str] = []
+
+        for path in seed_files:
+            if path in self.indexer.files and path not in impl_files:
+                if is_test_path(path):
+                    test_files.append(path)
+                else:
+                    impl_files.append(path)
+
+        for sym in seed_symbols:
+            for defn in (self.indexer.definitions(sym) or self.indexer.symbols_named(sym)):
+                if defn.file_path not in impl_files and not is_test_path(defn.file_path):
+                    impl_files.append(defn.file_path)
+                for caller in self.indexer.callers(defn.name):
+                    c_path = caller.file_path
+                    if is_test_path(c_path):
+                        if c_path not in test_files:
+                            test_files.append(c_path)
+                    elif c_path not in impl_files and c_path not in neighbor_files:
+                        neighbor_files.append(c_path)
+
+        for path in list(impl_files):
+            node = self.indexer.files.get(path)
+            if node is None:
+                continue
+            for imp in node.imports:
+                if imp in self.indexer.files and imp not in impl_files and imp not in neighbor_files:
+                    if is_test_path(imp):
+                        if imp not in test_files:
+                            test_files.append(imp)
+                    else:
+                        neighbor_files.append(imp)
+
+        # Discover any test files importing the implementation files
+        for path, node in sorted(self.indexer.files.items()):
+            if is_test_path(path) and path not in test_files:
+                if any(imp in impl_files or imp in neighbor_files for imp in node.imports):
+                    test_files.append(path)
+
+        return {
+            "implementation": impl_files,
+            "contracts_and_callers": neighbor_files,
+            "tests": test_files,
+        }
+
+    def pack_for_task(
+        self,
+        seed_files: Sequence[str] = (),
+        seed_symbols: Sequence[str] = (),
+        token_budget: int = 2048,
+        tokenizer=None,
+    ) -> Dict[str, Any]:
+        """Pack role-balanced context for an engineering task."""
+        roles = self.expand_neighborhood(seed_files=seed_files, seed_symbols=seed_symbols)
+        ordered_candidates: List[str] = []
+        for group in (roles["implementation"], roles["contracts_and_callers"], roles["tests"]):
+            for p in self.topo_packer.topological_order(group) if group else []:
+                if p not in ordered_candidates:
+                    ordered_candidates.append(p)
+        if not ordered_candidates:
+            ordered_candidates = self.topo_packer.topological_order()
+
+        packed = self.topo_packer.pack(
+            order=ordered_candidates, token_budget=token_budget, tokenizer=tokenizer
+        )
+        return {
+            "text": packed.text,
+            "order": packed.order,
+            "tokens_used": packed.tokens_used,
+            "truncated": packed.truncated,
+            "skipped": packed.skipped,
+            "roles": roles,
+        }

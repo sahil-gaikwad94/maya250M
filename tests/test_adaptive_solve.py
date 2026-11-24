@@ -233,5 +233,53 @@ class TestSolveTask(unittest.TestCase):
         self.assertTrue(result.verified)
 
 
+
+    def test_lexical_constraint_fallback_does_not_crash_or_claim_verified(self):
+        result = solve_task(
+            None,
+            None,
+            "Fix the bug. You must preserve the public API and must not add new dependencies.",
+            generate_fn=lambda prompt, loops: "We preserve the public API and add no new dependencies.",
+            config=SolveConfig(constraint_check=True, max_attempts=1),
+        )
+        self.assertIsNotNone(result.verification)
+        self.assertTrue(result.verification.passed)
+        self.assertTrue(result.verification.details.get("lexical_only"))
+        # Lexical addressing is never mechanical verification
+        self.assertFalse(result.verified)
+        self.assertEqual(result.measurement().status, MeasurementStatus.NOT_RUN)
+
+    def test_research_conjecture_certification_rejects_uncertified_universal_claim(self):
+        answers = [
+            "Checked n=1..15, so n^2 + n + 41 is proven for all n.",
+            "Counterexample found at n=40 (40^2 + 40 + 41 = 1681 = 41^2), so the claim is refuted.",
+        ]
+        calls = []
+
+        def gen(prompt, loops):
+            calls.append(prompt)
+            return answers[len(calls) - 1]
+
+        res = solve_task(
+            None,
+            None,
+            "Research hypothesis: Is every n^2 + n + 41 prime for all n?",
+            generate_fn=gen,
+            config=SolveConfig(max_attempts=2),
+        )
+        self.assertEqual(res.attempts, 2)
+        self.assertTrue(res.verified)
+        self.assertTrue(any("sweep" in s for s in res.subgoals))
+
+    def test_dynamic_early_halting_in_controller(self):
+        ctrl = AdaptiveLoopController(min_loops=1, max_loops=4)
+        h1 = ctrl.should_halt_early(1, current_entropy=0.02)
+        self.assertTrue(h1["halt"])
+        self.assertEqual(h1["reason"], "low_entropy_converged")
+        h2 = ctrl.should_halt_early(2, current_entropy=1.18, prev_entropy=1.20, cost_per_loop=0.08)
+        self.assertTrue(h2["halt"])
+        self.assertEqual(h2["reason"], "diminishing_marginal_gain")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -21,6 +21,7 @@ __all__ = [
     "STRATEGIES",
     "counterexample_first_plan",
     "certify_universal_claim",
+    "is_conjecture_or_universal_claim",
     "RESEARCH_STRATEGY",
 ]
 
@@ -128,6 +129,32 @@ class Decomposition:
         return "\n".join(lines)
 
 
+_CONJECTURE_MARKERS = (
+    "for all ",
+    "for every ",
+    "is every ",
+    "every ",
+    "always ",
+    "never ",
+    "conjecture",
+    "counterexample",
+    "hypothesis",
+    "falsif",
+    "disprove",
+    "prime",
+    "n^2",
+    "n**2",
+)
+
+
+def is_conjecture_or_universal_claim(spec: TaskSpec) -> bool:
+    """True when ``spec`` states an empirical/mathematical conjecture or universal claim."""
+    text = f"{spec.objective} {' '.join(spec.requirements)} {' '.join(spec.constraints)}".lower()
+    if any(marker in text for marker in _CONJECTURE_MARKERS):
+        return True
+    return False
+
+
 def decompose_task(
     spec: TaskSpec,
     repo_files: Optional[Sequence[str]] = None,
@@ -178,6 +205,12 @@ def decompose_task(
                 acceptance="all checks pass and constraints are covered",
             ),
         ]
+    elif (
+        spec.task_type in ("research", "math", "question")
+        and is_conjecture_or_universal_claim(spec)
+        and RESEARCH_STRATEGY in allowed
+    ):
+        return counterexample_first_plan(spec.objective)
     elif spec.task_type == "math":
         strategy = "derive_then_verify"
         subproblems = [
@@ -340,6 +373,8 @@ class StrategySelector:
             return "abstain"
         if spec.task_type in ("bug_fix", "code_edit", "refactor", "test_writing", "code_generation"):
             return "reproduce_then_patch" if spec.task_type == "bug_fix" else "localize_then_patch"
+        if spec.task_type in ("research", "math", "question") and is_conjecture_or_universal_claim(spec):
+            return RESEARCH_STRATEGY
         if spec.task_type == "math":
             return "derive_then_verify"
         if spec.task_type in ("research", "question", "explanation"):

@@ -344,6 +344,7 @@ class LexerState:
     raw_str: bool = False
     f_mode: bool = False
     f_brace_depth: int = 0
+    escape: bool = False
     stack: List[Tuple[str, Optional[str], int]] = field(default_factory=list)
     closed_frames: List[Tuple[str, Optional[str], int]] = field(default_factory=list)
     last_ident: str = ""
@@ -361,6 +362,7 @@ class LexerState:
             raw_str=self.raw_str,
             f_mode=self.f_mode,
             f_brace_depth=self.f_brace_depth,
+            escape=self.escape,
             stack=list(self.stack),
             closed_frames=[],
             last_ident=self.last_ident,
@@ -379,6 +381,7 @@ class LexerState:
             "closed_frames": list(self.closed_frames),
             "in_str": self.in_str,
             "f_brace_depth": self.f_brace_depth,
+            "escape": self.escape,
             "last_ident": self.last_ident,
             "prev_non_ws": self.prev_non_ws,
             "pending": self.pending,
@@ -448,14 +451,23 @@ def advance_lexer_state(state: LexerState, chunk: str, reset_closed: bool = True
                         st.stack.pop()
                 i += 1
                 continue
-            if ch == "\\" and i + 1 < n:
-                i += 2
+            if st.escape:
+                st.escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                if i + 1 < n:
+                    i += 2
+                else:
+                    st.escape = True
+                    i += 1
                 continue
             if text.startswith(st.in_str, i):
                 i += len(st.in_str)
                 st.in_str = None
                 st.f_mode = False
                 st.raw_str = False
+                st.escape = False
                 continue
             i += 1
             continue
@@ -549,11 +561,25 @@ def advance_lexer_state(state: LexerState, chunk: str, reset_closed: bool = True
 _VOCAB_STATIC_CACHE: Dict[Any, Tuple[np.ndarray, np.ndarray, Tuple[Tuple[int, str, int], ...]]] = {}
 _VOCAB_STATIC_CACHE_MAX = 8
 
+# ``token_category`` returns string constants, but the vocab cache stores a compact
+# integer code per entry. Map them explicitly instead of ``int(category)`` (which
+# raised ValueError on every non-numeric category such as ``legal_stop``).
+_CATEGORY_CODES: Dict[str, int] = {
+    NEVER_EMIT: 0,
+    LEGAL_STOP: 1,
+    PROTOCOL_MARKERS: 2,
+}
+ORDINARY_TOKEN_CODE = -1
+
 
 def _static_vocab_masks(
     vocab_map: Dict[int, str], tokenizer_hash: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[Tuple[int, str, int], ...]]:
-    """Classify a vocabulary once into never-emit / protocol / legal-candidate ids."""
+    """Classify a vocabulary once into never-emit / protocol / legal-candidate ids.
+
+    The third tuple field is a compact integer category code (``ORDINARY_TOKEN_CODE``
+    for unclassified tokens), never a raw string.
+    """
     key: Any = tokenizer_hash or f"id:{id(vocab_map)}:{len(vocab_map)}"
     cached = _VOCAB_STATIC_CACHE.get(key)
     if cached is not None:
@@ -569,7 +595,12 @@ def _static_vocab_masks(
         elif category == PROTOCOL_MARKERS:
             protocol_ids.append(int(tid))
         else:
-            entries.append((int(tid), tok_str, -1 if category is None else int(category)))
+            code = (
+                ORDINARY_TOKEN_CODE
+                if category is None
+                else _CATEGORY_CODES.get(category, ORDINARY_TOKEN_CODE)
+            )
+            entries.append((int(tid), tok_str, code))
 
     result = (
         np.asarray(never_ids, dtype=np.int64),
@@ -1212,6 +1243,386 @@ class Vexx35Controller:
 
     trigger_farkas_cdcl_jumpback = single_row_bound_contractor
 
+    def propagate_rational_polytope(
+        self,
+        constraints: List[Dict[str, Any]],
+        initial_bounds: Optional[Dict[str, Tuple[Any, Any]]] = None,
+        max_rounds: int = 8,
+    ) -> Dict[str, Any]:
+        """Multi-row exact rational interval contractor + Farkas infeasibility check.
+
+        Each constraint has ``{"coeffs": {var: a_i, ...}, "rhs": b, "op": "<=" | ">=" | "=="}``
+        representing ``sum_i a_i x_i <= b`` (or ``>=`` / ``==``). Bounds are tracked as
+        exact :class:`Fraction` pairs ``(lo, hi)`` (``None`` for ``-inf``/``+inf``).
+        When a row forces ``lo > hi`` on any variable, or a non-negative linear
+        combination of rows yields ``0 <= c < 0`` (Farkas certificate), ``feasible``
+        is ``False`` and the conflicting row indices are returned.
+        """
+        exact_bounds: Dict[str, List[Optional[Fraction]]] = {}
+        seed_bounds = initial_bounds if initial_bounds is not None else self.bounds
+        for var, (lo, hi) in (seed_bounds or {}).items():
+            lo_f = None if lo is None or lo == -float("inf") else Fraction(str(lo))
+            hi_f = None if hi is None or hi == float("inf") else Fraction(str(hi))
+            exact_bounds[str(var)] = [lo_f, hi_f]
+
+        normalized_rows: List[Tuple[int, Dict[str, Fraction], Fraction]] = []
+        for idx, row in enumerate(constraints):
+            op = str(row.get("op", "<=")).strip()
+            rhs = Fraction(str(row["rhs"]))
+            coeffs = {str(k): Fraction(str(val)) for k, val in (row.get("coeffs") or {}).items() if Fraction(str(val)) != 0}
+            for k in coeffs:
+                exact_bounds.setdefault(k, [None, None])
+            if op == "<=":
+                normalized_rows.append((idx, coeffs, rhs))
+            elif op == ">=":
+                normalized_rows.append((idx, {k: -c for k, c in coeffs.items()}, -rhs))
+            elif op in ("==", "="):
+                normalized_rows.append((idx, coeffs, rhs))
+                normalized_rows.append((idx, {k: -c for k, c in coeffs.items()}, -rhs))
+            else:
+                raise ValueError(f"unsupported constraint operator {op!r}")
+
+        # Check pairwise positive row combinations for direct Farkas contradiction:
+        # if c_1 + alpha * c_2 == 0 and rhs_1 + alpha * rhs_2 < 0 for alpha > 0.
+        for i in range(len(normalized_rows)):
+            idx1, c1, b1 = normalized_rows[i]
+            if not c1 and b1 < 0:
+                return {
+                    "feasible": False,
+                    "conflict_rows": [idx1],
+                    "conflict_vars": [],
+                    "farkas_certificate": {str(idx1): "1"},
+                    "bounds": {},
+                }
+            for j in range(i + 1, len(normalized_rows)):
+                idx2, c2, b2 = normalized_rows[j]
+                if set(c1.keys()) == set(c2.keys()) and c1:
+                    first_var = next(iter(c1))
+                    ratio = -c1[first_var] / c2[first_var]
+                    if ratio > 0 and all(c1[v] + ratio * c2[v] == 0 for v in c1):
+                        combined_rhs = b1 + ratio * b2
+                        if combined_rhs < 0:
+                            return {
+                                "feasible": False,
+                                "conflict_rows": sorted({idx1, idx2}),
+                                "conflict_vars": sorted(c1.keys()),
+                                "farkas_certificate": {str(idx1): "1", str(idx2): str(ratio)},
+                                "bounds": {},
+                            }
+
+        # Iterative multi-row bound propagation over exact Fractions
+        for _ in range(max(1, int(max_rounds))):
+            changed = False
+            for row_idx, coeffs, rhs in normalized_rows:
+                for target_var, a_c in coeffs.items():
+                    # Compute minimum possible sum of other terms: sum_{v != target_var} min(a_v * x_v)
+                    min_other = Fraction(0)
+                    possible = True
+                    for other_var, a_o in coeffs.items():
+                        if other_var == target_var:
+                            continue
+                        lo_o, hi_o = exact_bounds[other_var]
+                        if a_o > 0:
+                            if lo_o is None:
+                                possible = False
+                                break
+                            min_other += a_o * lo_o
+                        else:
+                            if hi_o is None:
+                                possible = False
+                                break
+                            min_other += a_o * hi_o
+                    if not possible:
+                        continue
+                    rem = rhs - min_other
+                    implied = rem / a_c
+                    cur_lo, cur_hi = exact_bounds[target_var]
+                    if a_c > 0:
+                        if cur_hi is None or implied < cur_hi:
+                            exact_bounds[target_var][1] = implied
+                            changed = True
+                    else:
+                        if cur_lo is None or implied > cur_lo:
+                            exact_bounds[target_var][0] = implied
+                            changed = True
+                    new_lo, new_hi = exact_bounds[target_var]
+                    if new_lo is not None and new_hi is not None and new_lo > new_hi:
+                        return {
+                            "feasible": False,
+                            "conflict_rows": [row_idx],
+                            "conflict_vars": sorted(coeffs.keys()),
+                            "farkas_certificate": {str(row_idx): "1"},
+                            "bounds": {
+                                k: (
+                                    -float("inf") if v[0] is None else float(v[0]),
+                                    float("inf") if v[1] is None else float(v[1]),
+                                )
+                                for k, v in exact_bounds.items()
+                            },
+                        }
+            if not changed:
+                break
+
+        # Exact multi-row Fourier-Motzkin elimination for general k-row Farkas infeasibility
+        # (catches 3+ variable contradictions like x+y<=2, y+z<=2, z+x<=2, x+y+z>=4 where no pair conflicts).
+        fm_vars = sorted(exact_bounds.keys())
+        if 1 <= len(fm_vars) <= 8 and len(normalized_rows) <= 24:
+            # Each FM row: (coeffs_dict, rhs_fraction, farkas_multipliers_dict)
+            fm_rows: List[Tuple[Dict[str, Fraction], Fraction, Dict[int, Fraction]]] = []
+            for r_idx, coeffs, rhs in normalized_rows:
+                fm_rows.append((dict(coeffs), rhs, {r_idx: Fraction(1)}))
+            # Also include finite variable bounds as virtual rows (keyed by -1 - i for traceability)
+            for v_i, var in enumerate(fm_vars):
+                lo_f, hi_f = exact_bounds[var]
+                if lo_f is not None:
+                    fm_rows.append(({var: Fraction(-1)}, -lo_f, {}))
+                if hi_f is not None:
+                    fm_rows.append(({var: Fraction(1)}, hi_f, {}))
+
+            for var in fm_vars:
+                pos_rows = []
+                neg_rows = []
+                zero_rows = []
+                for c_map, rhs_val, mults in fm_rows:
+                    a = c_map.get(var, Fraction(0))
+                    if a > 0:
+                        pos_rows.append((c_map, rhs_val, mults, a))
+                    elif a < 0:
+                        neg_rows.append((c_map, rhs_val, mults, -a))
+                    else:
+                        zero_rows.append((c_map, rhs_val, mults))
+                next_rows = list(zero_rows)
+                for p_map, p_rhs, p_mults, a_pos in pos_rows:
+                    for n_map, n_rhs, n_mults, a_neg in neg_rows:
+                        # Combine: (1/a_pos)*pos_row + (1/a_neg)*neg_row eliminates `var`
+                        w_p = Fraction(1, 1) / a_pos
+                        w_n = Fraction(1, 1) / a_neg
+                        comb: Dict[str, Fraction] = {}
+                        for k in set(p_map.keys()) | set(n_map.keys()):
+                            if k == var:
+                                continue
+                            val = p_map.get(k, Fraction(0)) * w_p + n_map.get(k, Fraction(0)) * w_n
+                            if val != 0:
+                                comb[k] = val
+                        comb_rhs = p_rhs * w_p + n_rhs * w_n
+                        comb_mults: Dict[int, Fraction] = {}
+                        for rk, rv in p_mults.items():
+                            comb_mults[rk] = comb_mults.get(rk, Fraction(0)) + rv * w_p
+                        for rk, rv in n_mults.items():
+                            comb_mults[rk] = comb_mults.get(rk, Fraction(0)) + rv * w_n
+                        if not comb:
+                            if comb_rhs < 0:
+                                nz_rows = sorted(k for k, v in comb_mults.items() if v > 0)
+                                cert = {str(k): str(comb_mults[k]) for k in nz_rows}
+                                cert["derived_rhs"] = str(comb_rhs)
+                                return {
+                                    "feasible": False,
+                                    "conflict_rows": nz_rows,
+                                    "conflict_vars": fm_vars,
+                                    "farkas_certificate": cert,
+                                    "bounds": {
+                                        k: (
+                                            -float("inf") if v[0] is None else float(v[0]),
+                                            float("inf") if v[1] is None else float(v[1]),
+                                        )
+                                        for k, v in exact_bounds.items()
+                                    },
+                                }
+                            continue
+                        next_rows.append((comb, comb_rhs, comb_mults))
+                        if len(next_rows) > 128:
+                            break
+                    if len(next_rows) > 128:
+                        break
+                fm_rows = next_rows
+                if not fm_rows or len(fm_rows) > 128:
+                    break
+
+        float_bounds: Dict[str, Tuple[float, float]] = {}
+        rational_bounds: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        for var, (lo_f, hi_f) in exact_bounds.items():
+            lo_flt = -float("inf") if lo_f is None else math.nextafter(float(lo_f), -float("inf"))
+            hi_flt = float("inf") if hi_f is None else math.nextafter(float(hi_f), float("inf"))
+            float_bounds[var] = (lo_flt, hi_flt)
+            rational_bounds[var] = (None if lo_f is None else str(lo_f), None if hi_f is None else str(hi_f))
+        self.bounds.update(float_bounds)
+        return {
+            "feasible": True,
+            "conflict_rows": [],
+            "conflict_vars": [],
+            "farkas_certificate": {},
+            "bounds": float_bounds,
+            "rational_bounds": rational_bounds,
+        }
+
+    @staticmethod
+    def synthesize_polynomial_hypothesis(
+        points: Sequence[Tuple[Any, Any]],
+        var_name: str = "n",
+        holdout_points: Sequence[Tuple[Any, Any]] = (),
+    ) -> Dict[str, Any]:
+        """Exact rational Lagrange interpolation over empirical ``(n, f(n))`` pairs.
+
+        Used during Stage 2 (``fit``) of the counterexample-first research protocol
+        to synthesize a closed-form symbolic candidate from Stage-1 observations and
+        check whether it generalizes to held-out points.
+        """
+        if not points:
+            raise ValueError("synthesize_polynomial_hypothesis requires at least one point")
+        if not var_name.isidentifier() or var_name.startswith("_"):
+            raise ValueError(f"invalid variable name {var_name!r}")
+        x_sym = sp.Symbol(var_name)
+        xs = [ sp.Rational(str(pt[0])) for pt in points ]
+        ys = [ sp.Rational(str(pt[1])) for pt in points ]
+        if len(set(xs)) != len(xs):
+            raise ValueError("interpolation x-coordinates must be distinct")
+
+        poly = sp.Integer(0)
+        k = len(xs)
+        for i in range(k):
+            term = ys[i]
+            for j in range(k):
+                if i != j:
+                    term = term * (x_sym - xs[j]) / (xs[i] - xs[j])
+            poly += term
+        simplified = sp.simplify(sp.expand(poly))
+        degree = int(sp.Poly(simplified, x_sym).degree()) if simplified != 0 else 0
+
+        holdout_matches = True
+        holdout_mismatches: List[Dict[str, str]] = []
+        for hx_raw, hy_raw in holdout_points:
+            hx = sp.Rational(str(hx_raw))
+            hy = sp.Rational(str(hy_raw))
+            pred = sp.simplify(simplified.subs(x_sym, hx))
+            if pred != hy:
+                holdout_matches = False
+                holdout_mismatches.append(
+                    {"x": str(hx), "expected": str(hy), "predicted": str(pred)}
+                )
+
+        return {
+            "expression": str(simplified),
+            "degree": degree,
+            "variable": var_name,
+            "points_used": len(points),
+            "holdout_verified": holdout_matches and len(holdout_points) > 0,
+            "holdout_mismatches": holdout_mismatches,
+        }
+
+    @staticmethod
+    def synthesize_recurrence_hypothesis(
+        sequence: Sequence[Any],
+        *,
+        max_order: int = 4,
+        holdout_count: int = 2,
+    ) -> Dict[str, Any]:
+        """Exact rational linear-recurrence / geometric hypothesis synthesizer.
+
+        Searches for the lowest-order exact homogeneous recurrence
+        ``a[n] = c_1 a[n-1] + ... + c_k a[n-k]`` (or affine recurrence
+        ``a[n] = c_0 + sum c_j a[n-j]``) over :class:`Fraction` using exact
+        Gaussian elimination, and verifies predictions on held-out tail terms.
+        """
+        vals = [Fraction(str(x)) for x in sequence]
+        n_total = len(vals)
+        if n_total < 4:
+            raise ValueError("synthesize_recurrence_hypothesis needs at least 4 sequence terms")
+        h_cnt = max(1, min(int(holdout_count), n_total - 3))
+        train = vals[:-h_cnt]
+        holdout = vals[-h_cnt:]
+
+        def _solve_exact_linear(mat: List[List[Fraction]], rhs: List[Fraction]) -> Optional[List[Fraction]]:
+            m = len(mat)
+            if m == 0:
+                return None
+            cols = len(mat[0])
+            if m < cols:
+                return None
+            aug = [list(mat[r]) + [rhs[r]] for r in range(m)]
+            piv_row = 0
+            for col in range(cols):
+                sel = None
+                for r in range(piv_row, m):
+                    if aug[r][col] != 0:
+                        sel = r
+                        break
+                if sel is None:
+                    return None
+                aug[piv_row], aug[sel] = aug[sel], aug[piv_row]
+                piv = aug[piv_row][col]
+                aug[piv_row] = [v / piv for v in aug[piv_row]]
+                for r in range(m):
+                    if r != piv_row and aug[r][col] != 0:
+                        factor = aug[r][col]
+                        aug[r] = [aug[r][c] - factor * aug[piv_row][c] for c in range(cols + 1)]
+                piv_row += 1
+            for r in range(cols, m):
+                if aug[r][cols] != 0:
+                    return None
+            return [aug[c][cols] for c in range(cols)]
+
+        for order in range(1, int(max_order) + 1):
+            for affine in (False, True):
+                n_eq = len(train) - order
+                n_vars = order + (1 if affine else 0)
+                if n_eq < n_vars:
+                    continue
+                mat: List[List[Fraction]] = []
+                rhs: List[Fraction] = []
+                for idx in range(order, len(train)):
+                    row = [train[idx - j] for j in range(1, order + 1)]
+                    if affine:
+                        row.append(Fraction(1))
+                    mat.append(row)
+                    rhs.append(train[idx])
+                sol = _solve_exact_linear(mat, rhs)
+                if sol is None:
+                    continue
+                coeffs = sol[:order]
+                const_term = sol[order] if affine else Fraction(0)
+
+                # Verify on all holdout terms autoregressively
+                buf = list(train)
+                mismatches: List[Dict[str, str]] = []
+                for h_idx, expected_val in enumerate(holdout):
+                    pred = const_term + sum(coeffs[j] * buf[-(j + 1)] for j in range(order))
+                    if pred != expected_val:
+                        mismatches.append(
+                            {"index": str(len(train) + h_idx), "expected": str(expected_val), "predicted": str(pred)}
+                        )
+                    buf.append(pred)
+                if not mismatches:
+                    terms = []
+                    for j, c in enumerate(coeffs, 1):
+                        if c != 0:
+                            terms.append(f"({c})*a[n-{j}]" if c != 1 else f"a[n-{j}]")
+                    if const_term != 0:
+                        terms.append(str(const_term))
+                    formula = "a[n] = " + (" + ".join(terms) if terms else "0")
+                    return {
+                        "verified": True,
+                        "order": order,
+                        "affine": affine,
+                        "coefficients": [str(c) for c in coeffs],
+                        "constant_term": str(const_term),
+                        "formula": formula,
+                        "holdout_verified": True,
+                        "holdout_count": h_cnt,
+                        "holdout_mismatches": [],
+                    }
+
+        return {
+            "verified": False,
+            "order": 0,
+            "affine": False,
+            "coefficients": [],
+            "constant_term": "0",
+            "formula": None,
+            "holdout_verified": False,
+            "holdout_count": h_cnt,
+            "holdout_mismatches": [],
+        }
+
     #: SI base-dimension vectors for the unit symbols Tier 4 can verify exactly.
     _DIMENSION_BASE = {
         "kg": {"M": 1},
@@ -1263,6 +1674,116 @@ class Vexx35Controller:
     @staticmethod
     def _normal_two_sided_p(statistic: float) -> float:
         return math.erfc(abs(float(statistic)) / math.sqrt(2.0))
+
+    @staticmethod
+    def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+        """Regularized incomplete beta I_x(a, b) via Lentz continued fraction (pure math)."""
+        if x <= 0.0:
+            return 0.0
+        if x >= 1.0:
+            return 1.0
+        if x > (a + 1.0) / (a + b + 2.0):
+            return 1.0 - Vexx35Controller._regularized_incomplete_beta(b, a, 1.0 - x)
+        log_bt = (
+            math.lgamma(a + b)
+            - math.lgamma(a)
+            - math.lgamma(b)
+            + a * math.log(x)
+            + b * math.log(1.0 - x)
+        )
+        bt = math.exp(log_bt)
+        fpmin = 1e-300
+        qab = a + b
+        qap = a + 1.0
+        qam = a - 1.0
+        c = 1.0
+        d = 1.0 - qab * x / qap
+        if abs(d) < fpmin:
+            d = fpmin
+        d = 1.0 / d
+        h = d
+        for m in range(1, 200):
+            m2 = 2 * m
+            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < fpmin:
+                d = fpmin
+            c = 1.0 + aa / c
+            if abs(c) < fpmin:
+                c = fpmin
+            d = 1.0 / d
+            h *= d * c
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < fpmin:
+                d = fpmin
+            c = 1.0 + aa / c
+            if abs(c) < fpmin:
+                c = fpmin
+            d = 1.0 / d
+            delta = d * c
+            h *= delta
+            if abs(delta - 1.0) < 1e-12:
+                break
+        return max(0.0, min(1.0, bt * h / a))
+
+    @classmethod
+    def _f_dist_survival(cls, f_val: float, df1: int, df2: int) -> float:
+        """Exact upper-tail p-value P(F_{df1, df2} >= f_val)."""
+        if f_val <= 0.0 or df1 <= 0 or df2 <= 0:
+            return 1.0
+        x = float(df2) / (float(df2) + float(df1) * float(f_val))
+        return cls._regularized_incomplete_beta(0.5 * float(df2), 0.5 * float(df1), x)
+
+    @classmethod
+    def _pearson_r_two_sided_p(cls, r_val: float, df: int) -> float:
+        """Exact two-sided p-value for Pearson correlation r with df = N - 2."""
+        r_abs = abs(float(r_val))
+        if df <= 0:
+            return 1.0
+        if r_abs >= 1.0:
+            return 0.0
+        t_stat = r_abs * math.sqrt(float(df) / max(1e-15, 1.0 - r_abs * r_abs))
+        return cls._student_t_two_sided_p(t_stat, df)
+
+    @staticmethod
+    def _student_t_two_sided_p(statistic: float, df: int) -> Optional[float]:
+        """Exact two-sided ``P(|T_df| > |t|)`` for integer ``df >= 1`` in pure math.
+
+        Uses the exact finite trigonometric series for the regularized incomplete
+        beta integral ``I_{df / (df + t^2)}(df/2, 1/2)`` over integer ``df``.
+        """
+        if df <= 0:
+            return None
+        t_abs = abs(float(statistic))
+        if t_abs == 0.0:
+            return 1.0
+        theta = math.atan(t_abs / math.sqrt(float(df)))
+        sin_t = math.sin(theta)
+        cos_t = math.cos(theta)
+        if df == 1:
+            p = 1.0 - (2.0 / math.pi) * theta
+            return max(0.0, min(1.0, p))
+        if df % 2 == 1:
+            # Odd df >= 3: 1 - (2/pi) * (theta + sin(theta)*cos(theta)*sum_{k=1}^{(df-1)//2 - 1} c_k cos^{2k}(theta))
+            series = 1.0
+            term = 1.0
+            cos2 = cos_t * cos_t
+            for k in range(1, (df - 1) // 2):
+                term *= (2.0 * k) / (2.0 * k + 1.0) * cos2
+                series += term
+            cdf_central = (2.0 / math.pi) * (theta + sin_t * cos_t * series)
+            return max(0.0, min(1.0, 1.0 - cdf_central))
+        else:
+            # Even df >= 2: 1 - sin(theta) * sum_{k=0}^{df/2 - 1} ((2k - 1)!! / (2k)!!) cos^{2k}(theta)
+            series = 1.0
+            term = 1.0
+            cos2 = cos_t * cos_t
+            for k in range(1, df // 2):
+                term *= (2.0 * k - 1.0) / (2.0 * k) * cos2
+                series += term
+            cdf_central = sin_t * series
+            return max(0.0, min(1.0, 1.0 - cdf_central))
 
     @staticmethod
     def _chi2_survival(statistic: float, df: int) -> Optional[float]:
@@ -1363,50 +1884,102 @@ class Vexx35Controller:
                         ),
                     }
 
-        # 3. Test-statistic / p-value consistency.
-        m_p = re.search(
-            r"\bp\s*=\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+\-]?\d+)?)", lower
-        )
-        if m_p is not None:
-            reported = float(m_p.group(1))
-            if 0.0 < reported <= 1.0:
-                m_z = re.search(r"\bz\s*=\s*([+\-]?\d+(?:\.\d+)?)", lower)
-                m_t = re.search(r"\bt\s*=\s*([+\-]?\d+(?:\.\d+)?)", lower)
-                m_df = re.search(r"\bdf\s*=\s*(\d+)", lower)
-                m_chi = re.search(r"(?:chi2|\u03c7\u00b2|chi-square)\s*=\s*(\d+(?:\.\d+)?)", lower)
-                expected: Optional[float] = None
-                label = ""
-                one_sided_lower_bound = False
-                if m_z is not None:
-                    expected = cls._normal_two_sided_p(float(m_z.group(1)))
-                    label = f"z={float(m_z.group(1)):g}"
-                elif m_chi is not None and m_df is not None:
-                    expected = cls._chi2_survival(float(m_chi.group(1)), int(m_df.group(1)))
-                    label = f"chi2={float(m_chi.group(1)):g}, df={int(m_df.group(1))}"
-                elif m_t is not None:
-                    t_value = abs(float(m_t.group(1)))
-                    expected = cls._normal_two_sided_p(t_value)
-                    label = f"t={t_value:g}"
-                    # Heavy t tails make the true p larger than the normal value, so
-                    # only a much smaller reported p is provably impossible.
-                    one_sided_lower_bound = bool(
-                        m_df is None or int(m_df.group(1)) < 30
-                    )
-                if expected is not None and expected > 0.0:
+        # 3. Multi-claim test-statistic / p-value consistency (z, Student-t, chi2, F, Pearson r).
+        # Scans every reported p-value in the text and pairs it with its nearest preceding statistic
+        # in the same sentence/clause so fabricated claims later in a paragraph cannot slip through.
+        p_pattern = re.compile(r"\bp\s*=\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+\-]?\d+)?)")
+        prev_p_end = 0
+        for m_p in p_pattern.finditer(lower):
+            reported_str = m_p.group(1)
+            reported = float(reported_str)
+            # Extract local clause preceding this p-value (bounded by previous p-value or sentence break)
+            raw_window = lower[prev_p_end:m_p.start()]
+            prev_p_end = m_p.end()
+            # Keep the last clause after the final sentence terminator ('. ' or '; ' or '\n')
+            clause = re.split(r"(?:\.\s+|;\s*|\n+)", raw_window)[-1]
+            if not (0.0 < reported <= 1.0):
+                continue
+
+            if "e" in reported_str:
+                reported_ulp = reported * 0.1
+            elif "." in reported_str:
+                decimals = len(reported_str.split(".", 1)[1])
+                reported_ulp = 10.0 ** (-decimals)
+            else:
+                reported_ulp = 0.01
+
+            # Find all candidate test statistics in this clause and pick the closest (rightmost) one
+            candidates_stat: List[Tuple[int, float, str, bool]] = []
+            m_df = re.search(r"\bdf\s*=\s*(\d+)", clause)
+
+            for m_z in re.finditer(r"\bz\s*=\s*([+\-]?\d+(?:\.\d+)?)", clause):
+                val = float(m_z.group(1))
+                candidates_stat.append((m_z.end(), cls._normal_two_sided_p(val), f"z={val:g}", False))
+
+            for m_f in re.finditer(
+                r"\bf\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*=\s*(\d+(?:\.\d+)?)", clause
+            ):
+                df1, df2, f_val = int(m_f.group(1)), int(m_f.group(2)), float(m_f.group(3))
+                candidates_stat.append((m_f.end(), cls._f_dist_survival(f_val, df1, df2), f"F({df1},{df2})={f_val:g}", False))
+
+            for m_r in re.finditer(
+                r"\br\s*\(\s*(?:df\s*=\s*)?(\d+)\s*\)\s*=\s*([+\-]?\d*(?:\.\d+)?)", clause
+            ):
+                df_r = int(m_r.group(1))
+                r_val = float(m_r.group(2))
+                if abs(r_val) <= 1.0:
+                    candidates_stat.append((m_r.end(), cls._pearson_r_two_sided_p(r_val, df_r), f"r({df_r})={r_val:g}", False))
+
+            for m_chi in re.finditer(
+                r"(?:chi2|\u03c7\u00b2|chi-square)(?:\s*\(\s*(?:df\s*=\s*)?(\d+)\s*\))?\s*=\s*(\d+(?:\.\d+)?)",
+                clause,
+            ):
+                if m_chi.group(1) is not None or m_df is not None:
+                    chi_val = float(m_chi.group(2))
+                    df_val = int(m_chi.group(1)) if m_chi.group(1) is not None else int(m_df.group(1))
+                    candidates_stat.append((m_chi.end(), cls._chi2_survival(chi_val, df_val), f"chi2={chi_val:g}, df={df_val}", False))
+
+            for m_t in re.finditer(
+                r"\bt(?:\s*\(\s*(?:df\s*=\s*)?(\d+)\s*\))?\s*=\s*([+\-]?\d+(?:\.\d+)?)",
+                clause,
+            ):
+                t_value = abs(float(m_t.group(2)))
+                if m_t.group(1) is not None or m_df is not None:
+                    df_val = int(m_t.group(1)) if m_t.group(1) is not None else int(m_df.group(1))
+                    candidates_stat.append((m_t.end(), cls._student_t_two_sided_p(t_value, df_val), f"t={t_value:g}, df={df_val}", False))
+                else:
+                    candidates_stat.append((m_t.end(), cls._normal_two_sided_p(t_value), f"t={t_value:g}", True))
+
+            if not candidates_stat:
+                continue
+
+            _, expected, label, one_sided_lower_bound = max(candidates_stat, key=lambda item: item[0])
+            if expected > 0.0:
+                abs_diff = abs(expected - reported)
+                rounding_tol = max(0.55 * reported_ulp, 0.002)
+                if abs_diff > rounding_tol:
                     ratio = max(expected / reported, reported / expected)
-                    too_far = ratio > 3.0 and abs(expected - reported) > 0.01
+                    alpha_flip = any(
+                        (reported <= alpha and expected > alpha)
+                        or (reported > alpha and expected <= alpha)
+                        for alpha in (0.05, 0.01, 0.001)
+                    )
                     if one_sided_lower_bound:
-                        too_far = reported * 10.0 < expected
+                        too_far = reported < expected - rounding_tol and (expected / reported) > 1.25
+                    else:
+                        too_far = alpha_flip or ratio > 1.25 or abs_diff > max(0.015, 2.5 * reported_ulp)
                     if too_far:
                         return {
                             "type": "statistical_inconsistency",
+                            "alpha_flip": "true" if alpha_flip else "false",
                             "verdict": "CONFLICT",
                             "explanation": (
-                                f"{label} implies p\u2248{expected:.4g}, but the report states "
-                                f"p={reported:g}; no df makes that pair possible.\n"
-                                "FINAL: CONFLICT"
+                                f"{label} implies p≈{expected:.4g}, but the report states "
+                                f"p={reported:g}; that discrepancy exceeds rounding tolerance."
+                                "\nFINAL: CONFLICT"
                             ),
                         }
+
         return None
 
     @staticmethod
@@ -1913,20 +2486,27 @@ class Vexx35Controller:
         fn_name: str,
         inputs: List[List[Any]],
         *,
+        log_probs: Optional[Sequence[float]] = None,
+        temperature: float = 1.0,
         timeout: float = 5.0,
     ) -> Dict[str, Any]:
-        """Minimum-Bayes-Risk consensus selection over executed outputs.
+        """Minimum-Bayes-Risk (MBR) selection over executed behavioral outputs.
 
-        Tier-1 AST policy and the ``fn_name`` arity contract filter candidates
-        first, then survivors run inside the Tier-5 sandbox on the supplied
-        self-generated probe inputs. The candidate whose output tuple is shared by
-        the most survivors wins (behavioural consensus), with ties broken by the
-        shortest AST and then by the least code. ``consensus`` is only true for a
-        strict majority of at least two agreeing survivors, so a lone candidate is
-        never reported as verified. The full scoreboard is returned for audit.
+        Computes the expected posterior risk ``R(y_i) = sum_j P(y_j | x) L(y_i, y_j)``
+        under the per-probe execution mismatch loss
+        ``L(y_i, y_j) = (1 / P) sum_{m=1}^P I[out_i(x_m) != out_j(x_m)]``,
+        where ``P(y_j | x)`` is the temperature-scaled softmax posterior over
+        eligible survivors (uniform ``1 / M`` when ``log_probs`` is omitted).
+        Selects ``argmin_{y_i} R(y_i)`` with ties broken by exact-tuple vote count,
+        shallowest AST depth, and shortest code length.
         """
         if not inputs:
             raise ValueError("MBR selection needs at least one probe input")
+        if log_probs is not None and len(log_probs) != len(candidates):
+            raise ValueError("len(log_probs) must equal len(candidates)")
+        if float(temperature) <= 0.0:
+            raise ValueError("temperature must be positive")
+
         probes = [{"input": list(inp)} for inp in inputs]
         scoreboard: List[Dict[str, Any]] = []
         for index, code in enumerate(candidates):
@@ -1957,6 +2537,7 @@ class Vexx35Controller:
                         after = after_repr
                     if after != inp:
                         mutation_free = False
+            raw_lp = float(log_probs[index]) if log_probs is not None else 0.0
             scoreboard.append(
                 {
                     "index": index,
@@ -1967,25 +2548,64 @@ class Vexx35Controller:
                     "outputs": outputs,
                     "mutation_free": mutation_free,
                     "ast_depth": self._ast_max_depth(code),
+                    "log_prob": raw_lp,
+                    "posterior_prob": 0.0,
+                    "bayes_risk": 1.0,
+                    "expected_utility": 0.0,
                     "error": error,
                 }
             )
 
         survivors = [row for row in scoreboard if row["executed"] and row["outputs"]]
         eligible = [row for row in survivors if row["mutation_free"]] or survivors
+
+        # Compute normalized posterior P(y_j | x) over eligible survivors
+        if eligible:
+            scaled = np.asarray(
+                [row["log_prob"] / float(temperature) for row in eligible],
+                dtype=np.float64,
+            )
+            scaled = scaled - np.max(scaled)
+            weights = np.exp(scaled)
+            posteriors = (weights / np.sum(weights)).tolist()
+            for row, prob in zip(eligible, posteriors):
+                row["posterior_prob"] = float(prob)
+
+            # Pairwise per-probe Hamming loss matrix L(y_i, y_j) in [0, 1]
+            n_probes = max(1, len(inputs))
+            for row_i in eligible:
+                out_i = row_i["outputs"]
+                risk = 0.0
+                for row_j, p_j in zip(eligible, posteriors):
+                    out_j = row_j["outputs"]
+                    disagree = sum(1 for a, b in zip(out_i, out_j) if a != b) / float(n_probes)
+                    risk += p_j * disagree
+                row_i["bayes_risk"] = float(risk)
+                row_i["expected_utility"] = float(1.0 - risk)
+
         counts: Dict[Tuple[str, ...], int] = {}
+        posterior_by_tuple: Dict[Tuple[str, ...], float] = {}
         for row in eligible:
             key = tuple(row["outputs"])
             counts[key] = counts.get(key, 0) + 1
-        best_votes = max(counts.values()) if counts else 0
-        tied_groups = {key for key, votes in counts.items() if votes == best_votes}
-        # Vote ties are broken by the simplest AST (then the shortest code), so a
-        # 1-1 behaviour split still yields the least complex explanation.
-        pool = [row for row in eligible if tuple(row["outputs"]) in tied_groups]
-        pool.sort(key=lambda row: (row["ast_depth"], len(row["code"]), row["index"]))
+            posterior_by_tuple[key] = posterior_by_tuple.get(key, 0.0) + row["posterior_prob"]
+
+        # Sort eligible candidates by minimal Bayes risk, then highest exact-tuple votes,
+        # then shallowest AST depth, then shortest code.
+        pool = list(eligible)
+        pool.sort(
+            key=lambda row: (
+                round(row["bayes_risk"], 9),
+                -counts.get(tuple(row["outputs"]), 0),
+                row["ast_depth"],
+                len(row["code"]),
+                row["index"],
+            )
+        )
         winner = pool[0] if pool else None
         best_outputs = tuple(winner["outputs"]) if winner is not None else ()
         votes = counts.get(best_outputs, 0)
+        posterior_mass = posterior_by_tuple.get(best_outputs, 0.0)
         agreement = (votes / len(eligible)) if eligible else 0.0
         return {
             "winner": winner["code"] if winner else None,
@@ -1994,7 +2614,17 @@ class Vexx35Controller:
             "votes": votes,
             "survivors": len(eligible),
             "agreement": agreement,
-            "consensus": bool(winner is not None and votes >= 2 and votes * 2 > len(eligible)),
+            "bayes_risk": winner["bayes_risk"] if winner else 1.0,
+            "expected_utility": winner["expected_utility"] if winner else 0.0,
+            "posterior_mass": float(posterior_mass),
+            "consensus": bool(
+                winner is not None
+                and len(eligible) >= 2
+                and (
+                    (votes >= 2 and votes * 2 > len(eligible))
+                    or (log_probs is not None and posterior_mass > 0.5 and votes >= 1)
+                )
+            ),
             "scoreboard": scoreboard,
         }
 

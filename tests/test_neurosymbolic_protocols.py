@@ -121,12 +121,36 @@ class TestCounterexampleFirstProtocol(unittest.TestCase):
         self.assertEqual(proven["verdict"], "PROVEN")
         self.assertTrue(proven["may_claim_for_all_n"])
 
-    def test_selector_still_handles_research_tasks(self):
-        spec = TaskSpec(objective="Is every n^2+n+41 prime?", task_type="research")
-        self.assertEqual(StrategySelector().select(spec), "retrieve_then_answer")
-        self.assertEqual(
-            decompose_task(spec).strategy, "retrieve_then_answer"
+    def test_selector_routes_conjectures_to_research_strategy(self):
+        conjecture_spec = TaskSpec(objective="Is every n^2+n+41 prime?", task_type="research")
+        self.assertEqual(StrategySelector().select(conjecture_spec), RESEARCH_STRATEGY)
+        plan = decompose_task(conjecture_spec)
+        self.assertEqual(plan.strategy, RESEARCH_STRATEGY)
+        self.assertEqual(plan.topological_order(), ["sweep", "fit", "falsify", "prove"])
+
+        lit_spec = TaskSpec(objective="Summarize the paper and cite the evidence.", task_type="research")
+        self.assertEqual(StrategySelector().select(lit_spec), "retrieve_then_answer")
+        self.assertEqual(decompose_task(lit_spec).strategy, "retrieve_then_answer")
+
+    def test_lagrange_hypothesis_synthesis_and_farkas_polytope(self):
+        vexx = Vexx35Controller()
+        hyp = vexx.synthesize_polynomial_hypothesis(
+            [(1, 43), (2, 47), (3, 53)], var_name="n", holdout_points=[(4, 61), (5, 71)]
         )
+        self.assertEqual(hyp["expression"], "n**2 + n + 41")
+        self.assertEqual(hyp["degree"], 2)
+        self.assertTrue(hyp["holdout_verified"])
+
+        # Multi-row Farkas infeasibility check: x + y <= 3 and x + y >= 5
+        infeasible = vexx.propagate_rational_polytope(
+            [
+                {"coeffs": {"x": 1, "y": 1}, "rhs": 3, "op": "<="},
+                {"coeffs": {"x": 1, "y": 1}, "rhs": 5, "op": ">="},
+            ]
+        )
+        self.assertFalse(infeasible["feasible"])
+        self.assertEqual(infeasible["conflict_rows"], [0, 1])
+        self.assertTrue(infeasible["farkas_certificate"])
 
 
 if __name__ == "__main__":

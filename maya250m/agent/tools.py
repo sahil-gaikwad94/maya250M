@@ -111,6 +111,18 @@ class ToolCallError(ValueError):
     """Raised when a tool is called with invalid arguments."""
 
 
+def _unittest_discover_cmd(executable: str, target: str) -> List[str]:
+    """Build a valid unittest command whether ``target`` is a directory or a .py file."""
+    cleaned = str(target or "").strip()
+    if "::" in cleaned:
+        cleaned = cleaned.split("::", 1)[0]
+    if cleaned.endswith(".py"):
+        start_dir = os.path.dirname(cleaned) or "."
+        pattern = os.path.basename(cleaned)
+        return [executable, "-B", "-m", "unittest", "discover", "-s", start_dir, "-p", pattern]
+    return [executable, "-B", "-m", "unittest", "discover", "-s", cleaned or "."]
+
+
 def _limit_child_factory(memory_limit_mb: int = 512, cpu_seconds: int = 30):
     """Build a ``preexec_fn`` that applies CPU/address-space/file limits."""
 
@@ -334,7 +346,7 @@ class RepoTools:
 
         commands = [
             [sys.executable, "-B", "-m", "pytest", "-q", target, "--no-header"],
-            [sys.executable, "-B", "-m", "unittest", "discover", "-s", target],
+            _unittest_discover_cmd(sys.executable, target),
         ]
         limiter = _limit_child_factory(
             self.memory_limit_mb if memory_limit_mb is None else int(memory_limit_mb),
@@ -408,15 +420,7 @@ class RepoTools:
             return failure("sandbox_error", exc.message, **exc.details)
 
         if "No module named pytest" in run.output:
-            command = [
-                sys.executable,
-                "-B",
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                target,
-            ]
+            command = _unittest_discover_cmd(sys.executable, target)
             try:
                 run = self.sandbox.run(
                     command, cwd=self.root, timeout=float(timeout_s) + 5.0

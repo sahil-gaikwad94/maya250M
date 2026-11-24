@@ -14,7 +14,13 @@ from typing import Any, Dict, List, Optional
 
 from ..verification import VerificationResult
 
-__all__ = ["CorrectionPlan", "diagnose_failure", "CorrectionPolicy"]
+__all__ = [
+    "CorrectionPlan",
+    "diagnose_failure",
+    "CorrectionPolicy",
+    "ast_normalized_fingerprint",
+    "extract_traceback_diagnosis",
+]
 
 #: category -> (action, human-readable instruction)
 _CORRECTION_TABLE: Dict[str, tuple] = {
@@ -138,6 +144,14 @@ class CorrectionPolicy:
     def __init__(self, max_attempts: int = 3):
         self.max_attempts = int(max_attempts)
         self.history: List[CorrectionPlan] = []
+        self.seen_patch_fingerprints: List[str] = []
+
+    def record_patch_attempt(self, code_or_patch: str) -> Dict[str, Any]:
+        """Fingerprint a proposed code/patch attempt and flag AST-equivalent duplicates."""
+        fp = ast_normalized_fingerprint(code_or_patch)
+        duplicate = fp in self.seen_patch_fingerprints
+        self.seen_patch_fingerprints.append(fp)
+        return {"fingerprint": fp, "is_duplicate": duplicate, "attempt": len(self.seen_patch_fingerprints)}
 
     def next_plan(self, result: VerificationResult) -> CorrectionPlan:
         if result.passed:
@@ -165,3 +179,97 @@ class CorrectionPolicy:
 
     def reset(self) -> None:
         self.history.clear()
+        self.seen_patch_fingerprints.clear()
+
+
+import ast
+import hashlib
+import re
+
+_TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in ([A-Za-z0-9_.<>]+)')
+_ASSERT_LINE_RE = re.compile(r"(AssertionError.*|E\s+assert\s+.+)")
+
+
+class _AlphaNormalizer(ast.NodeTransformer):
+    """Canonicalize local variable & parameter names inside functions for AST dedup."""
+
+    def _canonicalize_function(self, node: ast.AST) -> ast.AST:
+        mapping: Dict[str, str] = {}
+
+        def _bind(name: str) -> str:
+            if name not in mapping:
+                mapping[name] = f"_v{len(mapping)}"
+            return mapping[name]
+
+        # Bind positional/kwonly/vararg/kwarg parameter names
+        args = getattr(node, "args", None)
+        if args is not None:
+            for arg in list(getattr(args, "posonlyargs", [])) + list(args.args) + list(args.kwonlyargs):
+                arg.arg = _bind(arg.arg)
+            if args.vararg is not None:
+                args.vararg.arg = _bind(args.vararg.arg)
+            if args.kwarg is not None:
+                args.kwarg.arg = _bind(args.kwarg.arg)
+
+        # Collect locally assigned variable names (Store targets)
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                _bind(sub.id)
+
+        # Rewrite all Name nodes bound in this function scope
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in mapping:
+                sub.id = mapping[sub.id]
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        return self._canonicalize_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        return self._canonicalize_function(node)
+
+
+def ast_normalized_fingerprint(code_or_patch: str, *, alpha_normalize: bool = True) -> str:
+    """Compute a whitespace-, comment-, and local-variable-rename-invariant AST fingerprint."""
+    text = str(code_or_patch or "").strip()
+    try:
+        tree = ast.parse(text)
+        if alpha_normalize:
+            tree = _AlphaNormalizer().visit(tree)
+            ast.fix_missing_locations(tree)
+        canonical = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    except SyntaxError:
+        canonical = " ".join(text.split())
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def extract_traceback_diagnosis(
+    output_text: str, indexer: Any = None
+) -> Dict[str, Any]:
+    """Extract failing frames, assertions, and 1-hop repository call neighborhood from test output."""
+    text = str(output_text or "")
+    frames: List[Dict[str, Any]] = []
+    implicated_symbols: List[str] = []
+    implicated_callers: List[str] = []
+
+    for match in _TB_FRAME_RE.finditer(text):
+        file_path, line_str, func_name = match.group(1), match.group(2), match.group(3)
+        line_no = int(line_str)
+        frames.append({"file": file_path, "line": line_no, "function": func_name})
+        if func_name and not func_name.startswith("<") and func_name not in implicated_symbols:
+            implicated_symbols.append(func_name)
+        if indexer is not None and hasattr(indexer, "callers"):
+            for caller_site in indexer.callers(func_name) or []:
+                caller_q = getattr(caller_site, "caller_qualname", None)
+                if caller_q and caller_q not in implicated_callers:
+                    implicated_callers.append(caller_q)
+
+    assertions = [m.group(1).strip() for m in _ASSERT_LINE_RE.finditer(text)]
+    return {
+        "frames": frames,
+        "implicated_symbols": implicated_symbols,
+        "implicated_callers": implicated_callers,
+        "failing_assertions": assertions[:5],
+    }

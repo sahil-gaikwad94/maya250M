@@ -113,3 +113,62 @@ class AdaptiveLoopController:
                 "prior_failures": len(state.rejected_approaches) if state else 0,
             },
         }
+
+    def marginal_compute_value(
+        self,
+        loop_idx: int,
+        current_entropy: float,
+        prev_entropy: Optional[float] = None,
+        cost_per_loop: float = 0.08,
+    ) -> float:
+        """Estimated net value of executing another recurrent core pass.
+
+        Positive when the relative reduction in predictive uncertainty exceeds
+        ``cost_per_loop``; negative when representation refinement has saturated.
+        """
+        if loop_idx >= int(self.max_loops):
+            return -float(cost_per_loop)
+        cur = max(0.0, float(current_entropy))
+        if prev_entropy is None:
+            return float(cur - cost_per_loop)
+        prev = max(1e-6, float(prev_entropy))
+        relative_drop = (prev - cur) / prev
+        return float(relative_drop - float(cost_per_loop))
+
+    def should_halt_early(
+        self,
+        loop_idx: int,
+        current_entropy: float,
+        prev_entropy: Optional[float] = None,
+        *,
+        cost_per_loop: float = 0.08,
+        entropy_floor: float = 0.05,
+        top_margin: Optional[float] = None,
+        margin_threshold: float = 4.0,
+    ) -> Dict[str, Any]:
+        """Decide whether recurrent core refinement can halt at ``loop_idx`` (1-indexed)."""
+        step = int(loop_idx)
+        if step < int(self.min_loops):
+            return {"halt": False, "reason": "below_min_loops", "loop": step}
+        if step >= int(self.max_loops):
+            return {"halt": True, "reason": "reached_max_loops", "loop": step}
+        if float(current_entropy) <= float(entropy_floor):
+            return {"halt": True, "reason": "low_entropy_converged", "loop": step}
+        if top_margin is not None and float(top_margin) >= float(margin_threshold):
+            return {"halt": True, "reason": "high_logit_margin", "loop": step}
+        net_val = self.marginal_compute_value(
+            step, current_entropy, prev_entropy=prev_entropy, cost_per_loop=cost_per_loop
+        )
+        if prev_entropy is not None and net_val <= 0.0:
+            return {
+                "halt": True,
+                "reason": "diminishing_marginal_gain",
+                "loop": step,
+                "marginal_value": net_val,
+            }
+        return {
+            "halt": False,
+            "reason": "continue_refinement",
+            "loop": step,
+            "marginal_value": net_val,
+        }

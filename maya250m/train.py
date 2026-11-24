@@ -607,7 +607,15 @@ def train_maya(
             if max_grad_norm is not None and max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            optimizer.step()
+            if dev.type == "xla":
+                try:
+                    import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+                    xm.optimizer_step(optimizer, barrier=True)
+                except ImportError:
+                    optimizer.step()
+            else:
+                optimizer.step()
             scheduler.step()
 
             # Advance the resume cursor only after the whole group is consumed, so a

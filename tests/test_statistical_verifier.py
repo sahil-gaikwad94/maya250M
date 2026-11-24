@@ -74,6 +74,25 @@ class TestTestStatisticConsistency(unittest.TestCase):
         )
 
 
+
+    def test_alpha_boundary_flip_and_moderate_p_discrepancy_are_caught(self):
+        # z = 1.60 implies two-sided p = 0.1096 (> 0.05); reporting p = 0.04 (< 0.05) is a 2.74x ratio
+        # that v4 missed because ratio < 3.0, but flips significance across alpha = 0.05!
+        flagged = Vexx35Controller.verify_statistical_report("z = 1.60, p = 0.04")
+        self.assertIsNotNone(flagged)
+        self.assertEqual(flagged["type"], "statistical_inconsistency")
+
+        # Exact Student-t survival for df = 5: t = 2.0 implies two-sided p = 0.1019; reporting p = 0.04 is caught!
+        flagged_t = Vexx35Controller.verify_statistical_report("t = 2.0, df = 5, p = 0.04")
+        self.assertIsNotNone(flagged_t)
+        self.assertEqual(flagged_t["type"], "statistical_inconsistency")
+
+        # Exact Student-t for t = 2.571, df = 5 implies p = 0.0500 -> passes!
+        self.assertIsNone(
+            Vexx35Controller.verify_statistical_report("t = 2.571, df = 5, p = 0.05")
+        )
+
+
 class TestDimensionalHomogeneity(unittest.TestCase):
     def test_unit_vectors(self):
         self.assertEqual(

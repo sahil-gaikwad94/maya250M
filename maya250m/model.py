@@ -846,14 +846,11 @@ class MayaModel(nn.Module):
 
         # 2. Recurrent Core blocks (iterated ``loops`` times in continuous latent space)
         x_anchor = x
+        loop_exit_hiddens: List[torch.Tensor] = []
         for loop_idx in range(loops):
             if loop_idx > 0:
                 # BUG-06 fix: invert the residual so the loop state ``x`` is the
                 # unit-Jacobian backbone and the prelude anchor is gated by ``core_loop_gate``.
-                # At initialization (core_loop_gate=0, core_loop_norm=0, zero-centered
-                # RMSNorm), ``x`` now flows into Loop 1 intact (non-zero signal and
-                # non-zero gradients from step 1), while gate controls the injected
-                # anchor contribution rather than the entire loop output.
                 gate = torch.tanh(self.core_loop_gate)
                 x = rms_norm_fp32(x + gate * x_anchor, self.core_loop_norm, self.norm_eps, self.zc)
             for idx in range(p_end, c_end):
@@ -866,6 +863,15 @@ class MayaModel(nn.Module):
                     and labels is not None
                 ):
                     intermediate_hiddens.append(x)
+            loop_exit_hiddens.append(x)
+            if (
+                loop_idx < loops - 1
+                and intermediate_supervision_weight > 0.0
+                and labels is not None
+            ):
+                # Supervise intermediate recurrent core pass exits so every loop r in 1..R
+                # refines toward the shared unembedding manifold.
+                intermediate_hiddens.append(x)
 
         # 3. Coda blocks
         for idx in range(c_end, self.layers_n):
@@ -977,9 +983,39 @@ class MayaModel(nn.Module):
 
         if return_hidden:
             components["last_hidden"] = h
+            components["loop_hiddens"] = loop_exit_hiddens
         if return_components:
+            components["loop_count"] = loops
             return logits, loss, components
         return logits, loss
+
+    def stability_diagnostics(self) -> Dict[str, Any]:
+        """Inspect Differential-Attention lambda values and GDN gate/decay parameters."""
+        diff_lambdas: Dict[str, Dict[str, float]] = {}
+        gdn_gates: Dict[str, Dict[str, float]] = {}
+        with torch.no_grad():
+            for idx, block in enumerate(self.blocks):
+                if block.mixer_type == "full" and getattr(block.mixer, "diff_attn", False):
+                    lam = block.mixer.effective_lambda().detach().float()
+                    diff_lambdas[f"layer_{idx}"] = {
+                        "min": float(lam.min().item()),
+                        "mean": float(lam.mean().item()),
+                        "max": float(lam.max().item()),
+                    }
+                elif block.mixer_type == "gdn":
+                    a_log = block.mixer.A_log.detach().float()
+                    dt_b = block.mixer.dt_bias.detach().float()
+                    gdn_gates[f"layer_{idx}"] = {
+                        "A_log_mean": float(a_log.mean().item()),
+                        "dt_bias_mean": float(dt_b.mean().item()),
+                        "beta_scale": float(block.mixer.beta_scale),
+                    }
+            gate_val = float(torch.tanh(self.core_loop_gate.detach().float()).item())
+        return {
+            "core_loop_gate_tanh": gate_val,
+            "diff_attn_lambda": diff_lambdas,
+            "gdn_layers": gdn_gates,
+        }
 
     def prefill(
         self,

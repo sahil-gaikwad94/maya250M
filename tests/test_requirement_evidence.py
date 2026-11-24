@@ -147,5 +147,31 @@ class TestTypedVerifiers(unittest.TestCase):
         self.assertEqual(report["constraint_0"].status, RequirementStatus.VERIFIED)
 
 
+
+    def test_non_boolean_test_outcomes_cannot_falsely_pass(self):
+        requirement = {"requirement_id": "r1", "verifier_ids": ["test_outcomes"]}
+        for bad_val in (0, None, "failed", {"passed": False}):
+            res = verify_requirements(
+                [requirement],
+                {"required_test_ids": ["tests/test_a.py"], "test_results": {"tests/test_a.py": bad_val}},
+            )["r1"]
+            self.assertEqual(res.status, RequirementStatus.FAILED, f"falsely passed on {bad_val!r}")
+
+    def test_per_requirement_path_and_asymptotic_complexity_scoping(self):
+        reqs = [
+            {"requirement_id": "r_a", "text": "Create file pkg/a.py", "verifier_ids": ["path_presence"]},
+            {"requirement_id": "r_b", "text": "Create file pkg/b.py", "verifier_ids": ["path_presence"]},
+            {"requirement_id": "r_c", "text": "Keep runtime O(n log n)", "verifier_ids": ["complexity"]},
+        ]
+        rep = verify_requirements(
+            reqs,
+            {"present_paths": ["pkg/a.py"], "measured_complexity": "O(n)"},
+        )
+        # pkg/a.py exists, pkg/b.py is missing, and O(n) satisfies O(n log n)!
+        self.assertEqual(rep["r_a"].status, RequirementStatus.VERIFIED)
+        self.assertEqual(rep["r_b"].status, RequirementStatus.FAILED)
+        self.assertEqual(rep["r_c"].status, RequirementStatus.VERIFIED)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

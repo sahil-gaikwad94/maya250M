@@ -67,11 +67,15 @@ def detect_kaggle_accelerator() -> dict:
         }
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
+        # Size batch_size and grad_accum for the single active GPU process rather than
+        # multiplying by n_gpus before multi-GPU DDP is active.
         return {
             "backend": f"cuda_x{n_gpus}",
             "default_wall_hours": 11.25,
-            "batch_size": 4 * max(1, n_gpus),
-            "grad_accum": max(1, 32 // max(1, n_gpus)),
+            "batch_size": 4,
+            "grad_accum": 16,
+            "detected_devices": int(n_gpus),
+            "active_devices": 1,
             "dtype": "float16",
         }
     return {
@@ -93,6 +97,12 @@ def resolve_training_device(hw: Dict[str, object]) -> Tuple[torch.device, Dict[s
     """
     backend = str(hw.get("backend", "cpu"))
     world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    if world_size > 1:
+        raise SystemExit(
+            f"NOT_RUN: WORLD_SIZE={world_size} requested on backend='{backend}', but "
+            "train_maya250m_kaggle.py is a single-process trainer without DDP/PJRT "
+            "all-reduce gradient synchronization."
+        )
 
     if backend == "tpu":
         try:
@@ -103,11 +113,17 @@ def resolve_training_device(hw: Dict[str, object]) -> Tuple[torch.device, Dict[s
                 f"({exc}); install it or unset PJRT_DEVICE/TPU_NAME — refusing to "
                 "silently train on CPU"
             )
+        if world_size > 1:
+            raise SystemExit(
+                f"multi-process TPU training (WORLD_SIZE={world_size}) is NOT_RUN in "
+                "this single-process trainer; refusing to fake multi-core XLA execution"
+            )
         return xm.xla_device(), {
             "backend": backend,
             "device": "xla",
-            "parallel": "xla_multi" if world_size > 1 else "xla_single",
-            "world_size": world_size,
+            "parallel": "xla_single",
+            "world_size": 1,
+            "active_devices": 1,
         }
 
     if backend.startswith("cuda"):
@@ -116,12 +132,18 @@ def resolve_training_device(hw: Dict[str, object]) -> Tuple[torch.device, Dict[s
                 "CUDA backend detected but torch.cuda.is_available() is False; "
                 "refusing to silently train on CPU"
             )
+        if world_size > 1:
+            raise SystemExit(
+                f"multi-process CUDA DDP (WORLD_SIZE={world_size}) is NOT_RUN in "
+                "this single-process trainer; refusing to fake multi-GPU DDP on a single rank"
+            )
         local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
         return torch.device("cuda", local_rank), {
             "backend": backend,
             "device": f"cuda:{local_rank}",
-            "parallel": "ddp_not_implemented" if world_size > 1 else "single_gpu",
-            "world_size": world_size,
+            "parallel": "single_gpu",
+            "world_size": 1,
+            "active_devices": 1,
         }
 
     return torch.device("cpu"), {

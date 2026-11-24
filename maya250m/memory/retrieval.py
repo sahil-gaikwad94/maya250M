@@ -18,7 +18,7 @@ from .rerank import RerankCandidate, SharedTrunkNeuralReranker
 from .schema import MemoryRecord
 from .store import MayaMemoryStore
 
-__all__ = ["RetrievalTrace", "HybridRetriever", "tosco"]
+__all__ = ["RetrievalTrace", "HybridRetriever", "tosco", "mmr_diversify", "invalidate_stale_file_memories"]
 
 
 @dataclass
@@ -209,3 +209,55 @@ class HybridRetriever:
             return 1.0
         top = set(self.last_trace.reranked_ids[: int(k)])
         return float(sum(1 for rid in relevant_ids if rid in top) / len(relevant_ids))
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    ta = set(str(a or "").lower().split())
+    tb = set(str(b or "").lower().split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / float(len(ta | tb))
+
+
+def mmr_diversify(
+    candidates: Sequence[RerankCandidate],
+    top_k: int = 8,
+    lambda_mult: float = 0.75,
+) -> List[RerankCandidate]:
+    """Maximum Marginal Relevance diversification over reranked memory candidates."""
+    pool = list(candidates)
+    if len(pool) <= int(top_k):
+        return pool
+    selected: List[RerankCandidate] = []
+    lam = float(min(1.0, max(0.0, lambda_mult)))
+    while pool and len(selected) < int(top_k):
+        if not selected:
+            selected.append(pool.pop(0))
+            continue
+        best_idx = 0
+        best_mmr = -1e9
+        for idx, cand in enumerate(pool):
+            rel = float(cand.final_score if cand.final_score else cand.confidence)
+            max_sim = max(_token_jaccard(cand.content, s.content) for s in selected)
+            score = lam * rel - (1.0 - lam) * max_sim
+            if score > best_mmr:
+                best_mmr = score
+                best_idx = idx
+        selected.append(pool.pop(best_idx))
+    return selected
+
+
+def invalidate_stale_file_memories(
+    store: MayaMemoryStore, current_file_hashes: Dict[str, str]
+) -> List[str]:
+    """Mark repository memories as superseded when their backing file content hash changed."""
+    invalidated: List[str] = []
+    for record in store.list_memories(include_superseded=False):
+        ref = record.repo_ref
+        if ref is None or not ref.file_path or not ref.file_hash:
+            continue
+        cur_hash = current_file_hashes.get(ref.file_path)
+        if cur_hash is not None and cur_hash != ref.file_hash:
+            store.mark_superseded(record.memory_id, superseded_by=f"stale:{cur_hash[:12]}")
+            invalidated.append(record.memory_id)
+    return invalidated
